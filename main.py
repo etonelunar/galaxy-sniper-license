@@ -43,6 +43,39 @@ def init_db():
 
 init_db()
 
+class DeleteKeyRequest(BaseModel):
+    key: str
+
+
+@app.post("/admin/delete")
+def delete_key(data: DeleteKeyRequest, x_admin_secret: str = Header(...)):
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    key = (data.key or "").strip().upper()
+    if not key:
+        raise HTTPException(status_code=400, detail="Укажи key")
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT key FROM licenses WHERE key = %s", (key,))
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        conn.close()
+        return {"ok": False, "message": "Key not found", "deleted": None}
+
+    cur.execute("DELETE FROM licenses WHERE key = %s", (key,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {
+        "ok": True,
+        "message": "Key deleted",
+        "deleted": key
+    }
 
 # ---------- Models ----------
 class ActivateRequest(BaseModel):
