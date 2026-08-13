@@ -19,7 +19,6 @@ ADMIN_SECRET = os.getenv("ADMIN_SECRET", "change-me-to-something-long")
 
 
 def get_db():
-    """Подключение к Neon PostgreSQL."""
     conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     return conn
 
@@ -33,9 +32,14 @@ def init_db():
             used INTEGER DEFAULT 0,
             used_at TEXT,
             created_at TEXT,
-            hwid TEXT
+            hwid TEXT,
+            revoked INTEGER DEFAULT 0
         )
     """)
+    try:
+        cur.execute("ALTER TABLE licenses ADD COLUMN revoked INTEGER DEFAULT 0")
+    except Exception:
+        pass
     conn.commit()
     cur.close()
     conn.close()
@@ -43,39 +47,6 @@ def init_db():
 
 init_db()
 
-class DeleteKeyRequest(BaseModel):
-    key: str
-
-
-@app.post("/admin/delete")
-def delete_key(data: DeleteKeyRequest, x_admin_secret: str = Header(...)):
-    if x_admin_secret != ADMIN_SECRET:
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    key = (data.key or "").strip().upper()
-    if not key:
-        raise HTTPException(status_code=400, detail="Укажи key")
-
-    conn = get_db()
-    cur = conn.cursor()
-
-    cur.execute("SELECT key FROM licenses WHERE key = %s", (key,))
-    row = cur.fetchone()
-    if not row:
-        cur.close()
-        conn.close()
-        return {"ok": False, "message": "Key not found", "deleted": None}
-
-    cur.execute("DELETE FROM licenses WHERE key = %s", (key,))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    return {
-        "ok": True,
-        "message": "Key deleted",
-        "deleted": key
-    }
 
 # ---------- Models ----------
 class ActivateRequest(BaseModel):
@@ -91,6 +62,15 @@ class ValidateRequest(BaseModel):
 class ResetKeyRequest(BaseModel):
     key: Optional[str] = None
     hwid: Optional[str] = None
+
+
+class RevokeKeyRequest(BaseModel):
+    key: Optional[str] = None
+    hwid: Optional[str] = None
+
+
+class DeleteKeyRequest(BaseModel):
+    key: str
 
 
 class AddKeyRequest(BaseModel):
@@ -124,6 +104,11 @@ def activate(data: ActivateRequest):
         cur.close()
         conn.close()
         return {"valid": False, "message": "Key not found"}
+
+    if row.get("revoked") == 1:
+        cur.close()
+        conn.close()
+        return {"valid": False, "message": "Key revoked"}
 
     if row["used"] == 1:
         cur.close()
@@ -172,6 +157,9 @@ def validate(data: ValidateRequest):
     if row is None:
         return {"valid": False, "message": "Key not found"}
 
+    if row.get("revoked") == 1:
+        return {"valid": False, "message": "revoked"}
+
     if row["used"] != 1:
         return {"valid": False, "message": "Key not activated"}
 
@@ -185,6 +173,11 @@ def validate(data: ValidateRequest):
 # ---------- Admin endpoints ----------
 @app.post("/admin/reset")
 def reset_license(data: ResetKeyRequest, x_admin_secret: str = Header(...)):
+    """
+    Сброс активации:
+    - по key  → ключ снова available (used=0, hwid=NULL), revoked не трогаем
+    - по hwid → все ключи этого ПК снова available
+    """
     if x_admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -234,6 +227,95 @@ def reset_license(data: ResetKeyRequest, x_admin_secret: str = Header(...)):
     }
 
 
+@app.post("/admin/revoke")
+def revoke_key(data: RevokeKeyRequest, x_admin_secret: str = Header(...)):
+    """
+    Отзыв доступа:
+    - по key  → этот ключ revoked
+    - по hwid → все ключи этого ПК revoked
+    Клиент при старте получит message "revoked" и сбросит локальную активацию.
+    """
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not data.key and not data.hwid:
+        raise HTTPException(status_code=400, detail="Укажи key или hwid")
+
+    conn = get_db()
+    cur = conn.cursor()
+    revoked_keys = []
+
+    if data.key:
+        key = data.key.strip().upper()
+        cur.execute("SELECT key FROM licenses WHERE key = %s", (key,))
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            return {"ok": False, "message": "Key not found", "revoked": []}
+        cur.execute(
+            "UPDATE licenses SET revoked = 1 WHERE key = %s",
+            (key,)
+        )
+        revoked_keys.append(key)
+
+    if data.hwid:
+        hwid = data.hwid.strip()
+        cur.execute(
+            "SELECT key FROM licenses WHERE hwid = %s",
+            (hwid,)
+        )
+        rows = cur.fetchall()
+        for row in rows:
+            cur.execute(
+                "UPDATE licenses SET revoked = 1 WHERE key = %s",
+                (row["key"],)
+            )
+            revoked_keys.append(row["key"])
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {
+        "ok": True,
+        "revoked": revoked_keys,
+        "count": len(revoked_keys)
+    }
+
+
+@app.post("/admin/delete")
+def delete_key(data: DeleteKeyRequest, x_admin_secret: str = Header(...)):
+    """Полное удаление ключа из базы."""
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    key = (data.key or "").strip().upper()
+    if not key:
+        raise HTTPException(status_code=400, detail="Укажи key")
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT key FROM licenses WHERE key = %s", (key,))
+    row = cur.fetchone()
+    if not row:
+        cur.close()
+        conn.close()
+        return {"ok": False, "message": "Key not found", "deleted": None}
+
+    cur.execute("DELETE FROM licenses WHERE key = %s", (key,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {
+        "ok": True,
+        "message": "Key deleted",
+        "deleted": key
+    }
+
+
 @app.post("/admin/add-keys")
 def add_keys(data: AddKeyRequest, x_admin_secret: str = Header(...)):
     if x_admin_secret != ADMIN_SECRET:
@@ -251,7 +333,7 @@ def add_keys(data: AddKeyRequest, x_admin_secret: str = Header(...)):
 
         try:
             cur.execute(
-                "INSERT INTO licenses (key, used, created_at) VALUES (%s, 0, %s)",
+                "INSERT INTO licenses (key, used, created_at, revoked) VALUES (%s, 0, %s, 0)",
                 (key, datetime.utcnow().isoformat())
             )
             created.append(key)
@@ -274,7 +356,8 @@ def list_keys(x_admin_secret: str = Header(...)):
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
-        "SELECT key, used, used_at, created_at, hwid FROM licenses ORDER BY created_at DESC NULLS LAST"
+        "SELECT key, used, used_at, created_at, hwid, revoked "
+        "FROM licenses ORDER BY created_at DESC NULLS LAST"
     )
     rows = cur.fetchall()
     cur.close()
@@ -282,18 +365,27 @@ def list_keys(x_admin_secret: str = Header(...)):
 
     keys = []
     for row in rows:
+        if row.get("revoked") == 1:
+            status = "revoked"
+        elif row["used"] == 1:
+            status = "used"
+        else:
+            status = "available"
+
         keys.append({
             "key": row["key"],
-            "status": "used" if row["used"] == 1 else "available",
+            "status": status,
             "used_at": row["used_at"],
             "created_at": row["created_at"],
-            "hwid": row["hwid"]
+            "hwid": row["hwid"],
+            "revoked": bool(row.get("revoked") == 1)
         })
 
     return {
         "total": len(keys),
         "available": sum(1 for k in keys if k["status"] == "available"),
         "used": sum(1 for k in keys if k["status"] == "used"),
+        "revoked": sum(1 for k in keys if k["status"] == "revoked"),
         "keys": keys
     }
 
@@ -305,11 +397,28 @@ def stats(x_admin_secret: str = Header(...)):
 
     conn = get_db()
     cur = conn.cursor()
+
     cur.execute("SELECT COUNT(*) AS total FROM licenses")
     total = cur.fetchone()["total"]
-    cur.execute("SELECT COUNT(*) AS used FROM licenses WHERE used = 1")
+
+    cur.execute("SELECT COUNT(*) AS used FROM licenses WHERE used = 1 AND COALESCE(revoked, 0) = 0")
     used = cur.fetchone()["used"]
+
+    cur.execute("SELECT COUNT(*) AS revoked FROM licenses WHERE COALESCE(revoked, 0) = 1")
+    revoked = cur.fetchone()["revoked"]
+
+    cur.execute(
+        "SELECT COUNT(*) AS available FROM licenses "
+        "WHERE used = 0 AND COALESCE(revoked, 0) = 0"
+    )
+    available = cur.fetchone()["available"]
+
     cur.close()
     conn.close()
 
-    return {"total": total, "used": used, "available": total - used}
+    return {
+        "total": total,
+        "used": used,
+        "available": available,
+        "revoked": revoked
+    }
