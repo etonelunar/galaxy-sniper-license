@@ -26,6 +26,7 @@ def get_db():
 def init_db():
     conn = get_db()
     cur = conn.cursor()
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS licenses (
             key TEXT PRIMARY KEY,
@@ -38,6 +39,9 @@ def init_db():
             expires_at TEXT
         )
     """)
+    conn.commit()
+
+    # После ошибки PostgreSQL нужен rollback, иначе следующие ALTER не сработают
     for col, typedef in [
         ("revoked", "INTEGER DEFAULT 0"),
         ("duration_seconds", "INTEGER"),
@@ -45,9 +49,10 @@ def init_db():
     ]:
         try:
             cur.execute(f"ALTER TABLE licenses ADD COLUMN {col} {typedef}")
+            conn.commit()
         except Exception:
-            pass
-    conn.commit()
+            conn.rollback()
+
     cur.close()
     conn.close()
 
@@ -113,9 +118,10 @@ class DeleteKeyRequest(BaseModel):
 class AddKeyRequest(BaseModel):
     key: Optional[str] = None
     count: int = 1
-    # Срок действия с момента активации. Если оба None → permanent
+    # Срок с момента активации. Если оба None → permanent
     duration_days: Optional[int] = Field(default=None, ge=0)
     duration_hours: Optional[int] = Field(default=None, ge=0)
+    duration_seconds: Optional[int] = Field(default=None, ge=0)  # для тестов
 
 
 class ExtendKeyRequest(BaseModel):
@@ -198,7 +204,7 @@ def activate(data: ActivateRequest):
         "valid": True,
         "message": "Activated successfully",
         "token": token,
-        "expires_at": expires_at,  # null = permanent
+        "expires_at": expires_at,
         "permanent": expires_at is None,
     }
 
@@ -265,7 +271,6 @@ def reset_license(data: ResetKeyRequest, x_admin_secret: str = Header(...)):
             cur.close()
             conn.close()
             return {"ok": False, "message": "Key not found", "reset": []}
-        # used/hwid/expires_at сбрасываем; duration_seconds оставляем
         cur.execute(
             """
             UPDATE licenses
@@ -372,20 +377,20 @@ def delete_key(data: DeleteKeyRequest, x_admin_secret: str = Header(...)):
 def add_keys(data: AddKeyRequest, x_admin_secret: str = Header(...)):
     """
     Примеры:
-      {"count": 3}                              → 3 permanent-ключа
-      {"count": 5, "duration_days": 30}         → 5 ключей на 30 дней с активации
-      {"key": "VIP1", "duration_days": 7}       → один ключ VIP1 на 7 дней
-      {"count": 2, "duration_hours": 12}        → 2 ключа на 12 часов
-      {"duration_days": 1, "duration_hours": 12} → 1 день + 12 часов
+      {"count": 3}
+      {"count": 5, "duration_days": 30}
+      {"key": "VIP1", "duration_days": 7}
+      {"count": 2, "duration_hours": 12}
+      {"count": 1, "duration_seconds": 60}
     """
     if x_admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
 
     days = data.duration_days or 0
     hours = data.duration_hours or 0
-    duration_seconds = None
-    if days > 0 or hours > 0:
-        duration_seconds = days * 86400 + hours * 3600
+    secs = data.duration_seconds or 0
+    total = days * 86400 + hours * 3600 + secs
+    duration_seconds = total if total > 0 else None
 
     conn = get_db()
     cur = conn.cursor()
@@ -416,7 +421,6 @@ def add_keys(data: AddKeyRequest, x_admin_secret: str = Header(...)):
                     (duration_seconds % 86400) // 3600 if duration_seconds else None
                 ),
             })
-            # если передали конкретный key — только один
             if data.key:
                 break
         except psycopg2.IntegrityError:
@@ -437,11 +441,6 @@ def add_keys(data: AddKeyRequest, x_admin_secret: str = Header(...)):
 
 @app.post("/admin/extend")
 def extend_key(data: ExtendKeyRequest, x_admin_secret: str = Header(...)):
-    """
-    Продлить ключ или сделать permanent.
-      {"key": "ABC", "duration_days": 30}     → +30 дней к текущему expires_at (или от now)
-      {"key": "ABC", "permanent": true}       → убрать срок
-    """
     if x_admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -485,7 +484,6 @@ def extend_key(data: ExtendKeyRequest, x_admin_secret: str = Header(...)):
     base = current_exp if (current_exp and current_exp > now) else now
     new_exp = base + timedelta(seconds=add_seconds)
 
-    # обновляем и duration_seconds (суммарно от used_at, если есть)
     used_at = _parse_dt(row.get("used_at"))
     if used_at:
         duration_seconds = int((new_exp - used_at).total_seconds())
@@ -566,9 +564,7 @@ def stats(x_admin_secret: str = Header(...)):
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute(
-        "SELECT key, used, revoked, expires_at FROM licenses"
-    )
+    cur.execute("SELECT key, used, revoked, expires_at FROM licenses")
     rows = cur.fetchall()
     cur.close()
     conn.close()
