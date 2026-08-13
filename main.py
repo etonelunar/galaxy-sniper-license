@@ -45,6 +45,62 @@ class ActivateRequest(BaseModel):
     key: str
     hwid: str
 
+class ResetKeyRequest(BaseModel):
+    key: str = None      # сбросить конкретный ключ
+    hwid: str = None     # сбросить все ключи, привязанные к этому HWID
+
+
+@app.post("/admin/reset")
+def reset_license(data: ResetKeyRequest, x_admin_secret: str = Header(...)):
+    """
+    Откат активации:
+    - по key  → этот ключ снова available
+    - по hwid → все ключи, привязанные к этому ПК, снова available
+    """
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    if not data.key and not data.hwid:
+        raise HTTPException(status_code=400, detail="Укажи key или hwid")
+
+    conn = get_db()
+    reset_keys = []
+
+    if data.key:
+        key = data.key.strip().upper()
+        cur = conn.execute("SELECT key FROM licenses WHERE key = ?", (key,))
+        row = cur.fetchone()
+        if not row:
+            conn.close()
+            return {"ok": False, "message": "Key not found", "reset": []}
+        conn.execute(
+            "UPDATE licenses SET used = 0, used_at = NULL, hwid = NULL WHERE key = ?",
+            (key,)
+        )
+        reset_keys.append(key)
+
+    if data.hwid:
+        hwid = data.hwid.strip()
+        cur = conn.execute(
+            "SELECT key FROM licenses WHERE hwid = ? AND used = 1",
+            (hwid,)
+        )
+        rows = cur.fetchall()
+        for row in rows:
+            conn.execute(
+                "UPDATE licenses SET used = 0, used_at = NULL, hwid = NULL WHERE key = ?",
+                (row["key"],)
+            )
+            reset_keys.append(row["key"])
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "ok": True,
+        "reset": reset_keys,
+        "count": len(reset_keys)
+    }
 
 class AddKeyRequest(BaseModel):
     key: str = None
