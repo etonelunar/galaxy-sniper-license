@@ -60,7 +60,7 @@ def activate(data: ActivateRequest):
         conn.close()
         return {"valid": False, "message": "Key already used"}
 
-    # Помечаем ключ как использованный
+    # Помечаем ключ использованным
     now = datetime.utcnow().isoformat()
     conn.execute(
         "UPDATE licenses SET used = 1, used_at = ? WHERE key = ?",
@@ -69,7 +69,20 @@ def activate(data: ActivateRequest):
     conn.commit()
     conn.close()
 
-    return {"valid": True, "message": "Activated successfully"}
+    # Генерируем токен активации (его будет хранить программа)
+    import hashlib, hmac
+    secret = os.getenv("ADMIN_SECRET", "change-me")
+    token = hmac.new(
+        secret.encode(),
+        f"{key}:{now}".encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+    return {
+        "valid": True,
+        "message": "Activated successfully",
+        "token": token
+    }
 
 @app.post("/admin/add-keys")
 def add_keys(data: AddKeyRequest, x_admin_secret: str = Header(...)):
