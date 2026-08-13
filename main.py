@@ -2,27 +2,32 @@ from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 from datetime import datetime
 from typing import Optional
-import sqlite3
 import os
 import secrets
 import hashlib
 import hmac
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 app = FastAPI(title="Galaxy Sniper License Server")
 
-DB_PATH = "licenses.db"
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
+
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "change-me-to-something-long")
 
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    """Подключение к Neon PostgreSQL."""
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     return conn
 
 
 def init_db():
     conn = get_db()
-    conn.execute("""
+    cur = conn.cursor()
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS licenses (
             key TEXT PRIMARY KEY,
             used INTEGER DEFAULT 0,
@@ -31,11 +36,8 @@ def init_db():
             hwid TEXT
         )
     """)
-    try:
-        conn.execute("ALTER TABLE licenses ADD COLUMN hwid TEXT")
-    except Exception:
-        pass
     conn.commit()
+    cur.close()
     conn.close()
 
 
@@ -80,23 +82,28 @@ def activate(data: ActivateRequest):
         return {"valid": False, "message": "Empty HWID"}
 
     conn = get_db()
-    cur = conn.execute("SELECT * FROM licenses WHERE key = ?", (key,))
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM licenses WHERE key = %s", (key,))
     row = cur.fetchone()
 
     if row is None:
+        cur.close()
         conn.close()
         return {"valid": False, "message": "Key not found"}
 
     if row["used"] == 1:
+        cur.close()
         conn.close()
         return {"valid": False, "message": "Key already used"}
 
     now = datetime.utcnow().isoformat()
-    conn.execute(
-        "UPDATE licenses SET used = 1, used_at = ?, hwid = ? WHERE key = ?",
+    cur.execute(
+        "UPDATE licenses SET used = 1, used_at = %s, hwid = %s WHERE key = %s",
         (now, hwid, key)
     )
     conn.commit()
+    cur.close()
     conn.close()
 
     token = hmac.new(
@@ -123,13 +130,13 @@ def validate(data: ValidateRequest):
         return {"valid": False, "message": "Empty HWID"}
 
     conn = get_db()
-    cur = conn.execute("SELECT * FROM licenses WHERE key = ?", (key,))
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM licenses WHERE key = %s", (key,))
     row = cur.fetchone()
+    cur.close()
     conn.close()
 
     if row is None:
-        # После сна/деплоя на free Render БД часто пустая —
-        # клиент должен сохранить локальную активацию
         return {"valid": False, "message": "Key not found"}
 
     if row["used"] != 1:
@@ -152,36 +159,39 @@ def reset_license(data: ResetKeyRequest, x_admin_secret: str = Header(...)):
         raise HTTPException(status_code=400, detail="Укажи key или hwid")
 
     conn = get_db()
+    cur = conn.cursor()
     reset_keys = []
 
     if data.key:
         key = data.key.strip().upper()
-        cur = conn.execute("SELECT key FROM licenses WHERE key = ?", (key,))
+        cur.execute("SELECT key FROM licenses WHERE key = %s", (key,))
         row = cur.fetchone()
         if not row:
+            cur.close()
             conn.close()
             return {"ok": False, "message": "Key not found", "reset": []}
-        conn.execute(
-            "UPDATE licenses SET used = 0, used_at = NULL, hwid = NULL WHERE key = ?",
+        cur.execute(
+            "UPDATE licenses SET used = 0, used_at = NULL, hwid = NULL WHERE key = %s",
             (key,)
         )
         reset_keys.append(key)
 
     if data.hwid:
         hwid = data.hwid.strip()
-        cur = conn.execute(
-            "SELECT key FROM licenses WHERE hwid = ? AND used = 1",
+        cur.execute(
+            "SELECT key FROM licenses WHERE hwid = %s AND used = 1",
             (hwid,)
         )
         rows = cur.fetchall()
         for row in rows:
-            conn.execute(
-                "UPDATE licenses SET used = 0, used_at = NULL, hwid = NULL WHERE key = ?",
+            cur.execute(
+                "UPDATE licenses SET used = 0, used_at = NULL, hwid = NULL WHERE key = %s",
                 (row["key"],)
             )
             reset_keys.append(row["key"])
 
     conn.commit()
+    cur.close()
     conn.close()
 
     return {
@@ -197,6 +207,7 @@ def add_keys(data: AddKeyRequest, x_admin_secret: str = Header(...)):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     conn = get_db()
+    cur = conn.cursor()
     created = []
 
     for _ in range(max(1, min(data.count, 50))):
@@ -206,15 +217,17 @@ def add_keys(data: AddKeyRequest, x_admin_secret: str = Header(...)):
             key = secrets.token_hex(8).upper()
 
         try:
-            conn.execute(
-                "INSERT INTO licenses (key, used, created_at) VALUES (?, 0, ?)",
+            cur.execute(
+                "INSERT INTO licenses (key, used, created_at) VALUES (%s, 0, %s)",
                 (key, datetime.utcnow().isoformat())
             )
             created.append(key)
-        except sqlite3.IntegrityError:
-            pass
+        except psycopg2.IntegrityError:
+            conn.rollback()
+            continue
 
     conn.commit()
+    cur.close()
     conn.close()
 
     return {"created": created, "count": len(created)}
@@ -226,9 +239,12 @@ def list_keys(x_admin_secret: str = Header(...)):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     conn = get_db()
-    rows = conn.execute(
-        "SELECT key, used, used_at, created_at, hwid FROM licenses ORDER BY created_at DESC"
-    ).fetchall()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT key, used, used_at, created_at, hwid FROM licenses ORDER BY created_at DESC NULLS LAST"
+    )
+    rows = cur.fetchall()
+    cur.close()
     conn.close()
 
     keys = []
@@ -255,9 +271,12 @@ def stats(x_admin_secret: str = Header(...)):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     conn = get_db()
-    total = conn.execute("SELECT COUNT(*) FROM licenses").fetchone()[0]
-    used = conn.execute("SELECT COUNT(*) FROM licenses WHERE used = 1").fetchone()[0]
-    free = total - used
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) AS total FROM licenses")
+    total = cur.fetchone()["total"]
+    cur.execute("SELECT COUNT(*) AS used FROM licenses WHERE used = 1")
+    used = cur.fetchone()["used"]
+    cur.close()
     conn.close()
 
-    return {"total": total, "used": used, "available": free}
+    return {"total": total, "used": used, "available": total - used}
