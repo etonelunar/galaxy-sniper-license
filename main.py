@@ -127,6 +127,33 @@ def add_keys(data: AddKeyRequest, x_admin_secret: str = Header(...)):
 
     return {"created": created, "count": len(created)}
 
+@app.get("/admin/list-keys")
+def list_keys(x_admin_secret: str = Header(...)):
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT key, used, used_at, created_at, hwid FROM licenses ORDER BY created_at DESC"
+    ).fetchall()
+    conn.close()
+
+    keys = []
+    for row in rows:
+        keys.append({
+            "key": row["key"],
+            "status": "used" if row["used"] == 1 else "available",
+            "used_at": row["used_at"],
+            "created_at": row["created_at"],
+            "hwid": row["hwid"]
+        })
+
+    return {
+        "total": len(keys),
+        "available": sum(1 for k in keys if k["status"] == "available"),
+        "used": sum(1 for k in keys if k["status"] == "used"),
+        "keys": keys
+    }
 
 @app.get("/admin/stats")
 def stats(x_admin_secret: str = Header(...)):
