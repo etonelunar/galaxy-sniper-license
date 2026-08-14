@@ -1,3 +1,8 @@
+"""
+Galaxy Sniper License Server
++ force-update / kill-switch для клиента
+"""
+
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
 from datetime import datetime, timedelta
@@ -17,10 +22,12 @@ if not DATABASE_URL:
 
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "change-me-to-something-long")
 
+# Текущая «официальная» версия сервера (информативно)
+SERVER_LATEST_VERSION = os.getenv("LATEST_VERSION", "1.0.0")
+
 
 def get_db():
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-    return conn
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 
 def init_db():
@@ -41,7 +48,6 @@ def init_db():
     """)
     conn.commit()
 
-    # После ошибки PostgreSQL нужен rollback, иначе следующие ALTER не сработают
     for col, typedef in [
         ("revoked", "INTEGER DEFAULT 0"),
         ("duration_seconds", "INTEGER"),
@@ -53,6 +59,33 @@ def init_db():
         except Exception:
             conn.rollback()
 
+    # Ключ-значение конфиг приложения (force update и т.д.)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS app_config (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    conn.commit()
+
+    defaults = {
+        "force_update": "0",
+        "min_version": "1.0.0",
+        "latest_version": SERVER_LATEST_VERSION,
+        "update_message": "Доступно обязательное обновление. Установите новую версию, чтобы продолжить.",
+        "update_url": "",
+        "block_all": "0",  # полный kill-switch без привязки к версии
+        "block_message": "Сервис временно недоступен. Обратитесь в поддержку.",
+    }
+    for k, v in defaults.items():
+        cur.execute(
+            """
+            INSERT INTO app_config (key, value) VALUES (%s, %s)
+            ON CONFLICT (key) DO NOTHING
+            """,
+            (k, v),
+        )
+    conn.commit()
     cur.close()
     conn.close()
 
@@ -90,6 +123,54 @@ def _status_of(row: dict) -> str:
     return "available"
 
 
+def _get_config() -> dict:
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT key, value FROM app_config")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return {r["key"]: r["value"] for r in rows}
+
+
+def _set_config(updates: dict):
+    conn = get_db()
+    cur = conn.cursor()
+    for k, v in updates.items():
+        cur.execute(
+            """
+            INSERT INTO app_config (key, value) VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """,
+            (k, str(v) if v is not None else ""),
+        )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def _parse_version(v: str):
+    """'1.2.3' -> (1, 2, 3); нечисловые куски = 0."""
+    if not v:
+        return (0, 0, 0)
+    parts = []
+    for p in str(v).strip().lstrip("vV").split("."):
+        num = ""
+        for ch in p:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        parts.append(int(num) if num else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
+
+
+def _version_less(a: str, b: str) -> bool:
+    return _parse_version(a) < _parse_version(b)
+
+
 # ---------- Models ----------
 class ActivateRequest(BaseModel):
     key: str
@@ -118,10 +199,9 @@ class DeleteKeyRequest(BaseModel):
 class AddKeyRequest(BaseModel):
     key: Optional[str] = None
     count: int = 1
-    # Срок с момента активации. Если оба None → permanent
     duration_days: Optional[int] = Field(default=None, ge=0)
     duration_hours: Optional[int] = Field(default=None, ge=0)
-    duration_seconds: Optional[int] = Field(default=None, ge=0)  # для тестов
+    duration_seconds: Optional[int] = Field(default=None, ge=0)
 
 
 class ExtendKeyRequest(BaseModel):
@@ -131,10 +211,86 @@ class ExtendKeyRequest(BaseModel):
     permanent: bool = False
 
 
-# ---------- Public endpoints ----------
+class ClientCheckRequest(BaseModel):
+    version: str
+    hwid: Optional[str] = None
+
+
+class ForceUpdateRequest(BaseModel):
+    """Включить/выключить обязательное обновление и полный блок."""
+    force_update: Optional[bool] = None
+    block_all: Optional[bool] = None
+    min_version: Optional[str] = None
+    latest_version: Optional[str] = None
+    update_message: Optional[str] = None
+    update_url: Optional[str] = None
+    block_message: Optional[str] = None
+
+
+# ---------- Public ----------
 @app.get("/")
 def root():
     return {"status": "ok", "service": "Galaxy Sniper License"}
+
+
+@app.post("/client/check")
+def client_check(data: ClientCheckRequest):
+    """
+    Клиент вызывает при старте.
+    Возвращает, можно ли работать, или нужно обновиться / сервис заблокирован.
+    """
+    cfg = _get_config()
+    client_ver = (data.version or "").strip()
+    min_ver = (cfg.get("min_version") or "1.0.0").strip()
+    latest = (cfg.get("latest_version") or min_ver).strip()
+    force = cfg.get("force_update") == "1"
+    block_all = cfg.get("block_all") == "1"
+
+    update_message = cfg.get("update_message") or ""
+    update_url = cfg.get("update_url") or ""
+    block_message = cfg.get("block_message") or ""
+
+    # Полный kill-switch
+    if block_all:
+        return {
+            "ok": False,
+            "blocked": True,
+            "force_update": False,
+            "message": block_message or "Сервис временно недоступен.",
+            "min_version": min_ver,
+            "latest_version": latest,
+            "update_url": update_url,
+            "client_version": client_ver,
+        }
+
+    # Обязательное обновление, если версия клиента ниже min_version
+    needs_update = force and _version_less(client_ver, min_ver)
+    # Даже без force — мягкая подсказка, что есть новее
+    outdated = _version_less(client_ver, latest)
+
+    if needs_update:
+        return {
+            "ok": False,
+            "blocked": False,
+            "force_update": True,
+            "message": update_message or "Требуется обновление.",
+            "min_version": min_ver,
+            "latest_version": latest,
+            "update_url": update_url,
+            "client_version": client_ver,
+        }
+
+    return {
+        "ok": True,
+        "blocked": False,
+        "force_update": False,
+        "outdated": outdated,
+        "message": "" if not outdated else (update_message or "Доступна новая версия."),
+        "min_version": min_ver,
+        "latest_version": latest,
+        "update_url": update_url,
+        "client_version": client_ver,
+    }
 
 
 @app.post("/activate")
@@ -147,9 +303,16 @@ def activate(data: ActivateRequest):
     if not hwid:
         return {"valid": False, "message": "Empty HWID"}
 
+    # Не даём активировать, если полный блок
+    cfg = _get_config()
+    if cfg.get("block_all") == "1":
+        return {
+            "valid": False,
+            "message": cfg.get("block_message") or "Сервис временно недоступен",
+        }
+
     conn = get_db()
     cur = conn.cursor()
-
     cur.execute("SELECT * FROM licenses WHERE key = %s", (key,))
     row = cur.fetchone()
 
@@ -182,10 +345,7 @@ def activate(data: ActivateRequest):
     cur.execute(
         """
         UPDATE licenses
-        SET used = 1,
-            used_at = %s,
-            hwid = %s,
-            expires_at = %s
+        SET used = 1, used_at = %s, hwid = %s, expires_at = %s
         WHERE key = %s
         """,
         (now.isoformat(), hwid, expires_at, key),
@@ -197,7 +357,7 @@ def activate(data: ActivateRequest):
     token = hmac.new(
         ADMIN_SECRET.encode(),
         f"{key}|{hwid}|{now.isoformat()}".encode(),
-        hashlib.sha256
+        hashlib.sha256,
     ).hexdigest()
 
     return {
@@ -218,6 +378,15 @@ def validate(data: ValidateRequest):
         return {"valid": False, "message": "Empty key"}
     if not hwid:
         return {"valid": False, "message": "Empty HWID"}
+
+    cfg = _get_config()
+    if cfg.get("block_all") == "1":
+        return {
+            "valid": False,
+            "message": "blocked",
+            "blocked": True,
+            "block_message": cfg.get("block_message") or "Сервис временно недоступен",
+        }
 
     conn = get_db()
     cur = conn.cursor()
@@ -250,12 +419,61 @@ def validate(data: ValidateRequest):
     }
 
 
-# ---------- Admin endpoints ----------
+# ---------- Admin ----------
+@app.get("/admin/app-config")
+def admin_get_app_config(x_admin_secret: str = Header(...)):
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    cfg = _get_config()
+    return {
+        "force_update": cfg.get("force_update") == "1",
+        "block_all": cfg.get("block_all") == "1",
+        "min_version": cfg.get("min_version") or "1.0.0",
+        "latest_version": cfg.get("latest_version") or "1.0.0",
+        "update_message": cfg.get("update_message") or "",
+        "update_url": cfg.get("update_url") or "",
+        "block_message": cfg.get("block_message") or "",
+    }
+
+
+@app.post("/admin/force-update")
+def admin_force_update(data: ForceUpdateRequest, x_admin_secret: str = Header(...)):
+    """
+    Примеры:
+      {"force_update": true, "min_version": "1.1.0", "update_message": "...", "update_url": "https://..."}
+      {"block_all": true, "block_message": "Техработы"}
+      {"force_update": false, "block_all": false}
+    """
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    updates = {}
+    if data.force_update is not None:
+        updates["force_update"] = "1" if data.force_update else "0"
+    if data.block_all is not None:
+        updates["block_all"] = "1" if data.block_all else "0"
+    if data.min_version is not None:
+        updates["min_version"] = data.min_version.strip()
+    if data.latest_version is not None:
+        updates["latest_version"] = data.latest_version.strip()
+    if data.update_message is not None:
+        updates["update_message"] = data.update_message
+    if data.update_url is not None:
+        updates["update_url"] = data.update_url
+    if data.block_message is not None:
+        updates["block_message"] = data.block_message
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="Нечего обновлять")
+
+    _set_config(updates)
+    return {"ok": True, "config": admin_get_app_config(x_admin_secret)}
+
+
 @app.post("/admin/reset")
 def reset_license(data: ResetKeyRequest, x_admin_secret: str = Header(...)):
     if x_admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
-
     if not data.key and not data.hwid:
         raise HTTPException(status_code=400, detail="Укажи key или hwid")
 
@@ -283,10 +501,7 @@ def reset_license(data: ResetKeyRequest, x_admin_secret: str = Header(...)):
 
     if data.hwid:
         hwid = data.hwid.strip()
-        cur.execute(
-            "SELECT key FROM licenses WHERE hwid = %s AND used = 1",
-            (hwid,),
-        )
+        cur.execute("SELECT key FROM licenses WHERE hwid = %s AND used = 1", (hwid,))
         rows = cur.fetchall()
         for row in rows:
             cur.execute(
@@ -302,7 +517,6 @@ def reset_license(data: ResetKeyRequest, x_admin_secret: str = Header(...)):
     conn.commit()
     cur.close()
     conn.close()
-
     return {"ok": True, "reset": reset_keys, "count": len(reset_keys)}
 
 
@@ -310,7 +524,6 @@ def reset_license(data: ResetKeyRequest, x_admin_secret: str = Header(...)):
 def revoke_key(data: RevokeKeyRequest, x_admin_secret: str = Header(...)):
     if x_admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
-
     if not data.key and not data.hwid:
         raise HTTPException(status_code=400, detail="Укажи key или hwid")
 
@@ -321,8 +534,7 @@ def revoke_key(data: RevokeKeyRequest, x_admin_secret: str = Header(...)):
     if data.key:
         key = data.key.strip().upper()
         cur.execute("SELECT key FROM licenses WHERE key = %s", (key,))
-        row = cur.fetchone()
-        if not row:
+        if not cur.fetchone():
             cur.close()
             conn.close()
             return {"ok": False, "message": "Key not found", "revoked": []}
@@ -332,18 +544,13 @@ def revoke_key(data: RevokeKeyRequest, x_admin_secret: str = Header(...)):
     if data.hwid:
         hwid = data.hwid.strip()
         cur.execute("SELECT key FROM licenses WHERE hwid = %s", (hwid,))
-        rows = cur.fetchall()
-        for row in rows:
-            cur.execute(
-                "UPDATE licenses SET revoked = 1 WHERE key = %s",
-                (row["key"],),
-            )
+        for row in cur.fetchall():
+            cur.execute("UPDATE licenses SET revoked = 1 WHERE key = %s", (row["key"],))
             revoked_keys.append(row["key"])
 
     conn.commit()
     cur.close()
     conn.close()
-
     return {"ok": True, "revoked": revoked_keys, "count": len(revoked_keys)}
 
 
@@ -351,7 +558,6 @@ def revoke_key(data: RevokeKeyRequest, x_admin_secret: str = Header(...)):
 def delete_key(data: DeleteKeyRequest, x_admin_secret: str = Header(...)):
     if x_admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
-
     key = (data.key or "").strip().upper()
     if not key:
         raise HTTPException(status_code=400, detail="Укажи key")
@@ -359,30 +565,19 @@ def delete_key(data: DeleteKeyRequest, x_admin_secret: str = Header(...)):
     conn = get_db()
     cur = conn.cursor()
     cur.execute("SELECT key FROM licenses WHERE key = %s", (key,))
-    row = cur.fetchone()
-    if not row:
+    if not cur.fetchone():
         cur.close()
         conn.close()
         return {"ok": False, "message": "Key not found", "deleted": None}
-
     cur.execute("DELETE FROM licenses WHERE key = %s", (key,))
     conn.commit()
     cur.close()
     conn.close()
-
     return {"ok": True, "message": "Key deleted", "deleted": key}
 
 
 @app.post("/admin/add-keys")
 def add_keys(data: AddKeyRequest, x_admin_secret: str = Header(...)):
-    """
-    Примеры:
-      {"count": 3}
-      {"count": 5, "duration_days": 30}
-      {"key": "VIP1", "duration_days": 7}
-      {"count": 2, "duration_hours": 12}
-      {"count": 1, "duration_seconds": 60}
-    """
     if x_admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
 
@@ -401,14 +596,12 @@ def add_keys(data: AddKeyRequest, x_admin_secret: str = Header(...)):
             key = data.key.strip().upper()
         else:
             key = secrets.token_hex(8).upper()
-
         try:
             cur.execute(
                 """
                 INSERT INTO licenses
                     (key, used, created_at, revoked, duration_seconds, expires_at)
-                VALUES
-                    (%s, 0, %s, 0, %s, NULL)
+                VALUES (%s, 0, %s, 0, %s, NULL)
                 """,
                 (key, _now().isoformat(), duration_seconds),
             )
@@ -416,10 +609,6 @@ def add_keys(data: AddKeyRequest, x_admin_secret: str = Header(...)):
                 "key": key,
                 "permanent": duration_seconds is None,
                 "duration_seconds": duration_seconds,
-                "duration_days": (duration_seconds // 86400) if duration_seconds else None,
-                "duration_hours": (
-                    (duration_seconds % 86400) // 3600 if duration_seconds else None
-                ),
             })
             if data.key:
                 break
@@ -430,7 +619,6 @@ def add_keys(data: AddKeyRequest, x_admin_secret: str = Header(...)):
     conn.commit()
     cur.close()
     conn.close()
-
     return {
         "created": created,
         "count": len(created),
@@ -456,11 +644,7 @@ def extend_key(data: ExtendKeyRequest, x_admin_secret: str = Header(...)):
 
     if data.permanent:
         cur.execute(
-            """
-            UPDATE licenses
-            SET duration_seconds = NULL, expires_at = NULL
-            WHERE key = %s
-            """,
+            "UPDATE licenses SET duration_seconds = NULL, expires_at = NULL WHERE key = %s",
             (key,),
         )
         conn.commit()
@@ -474,10 +658,7 @@ def extend_key(data: ExtendKeyRequest, x_admin_secret: str = Header(...)):
     if add_seconds <= 0:
         cur.close()
         conn.close()
-        raise HTTPException(
-            status_code=400,
-            detail="Укажи duration_days/duration_hours или permanent=true",
-        )
+        raise HTTPException(status_code=400, detail="Укажи duration_days/duration_hours или permanent=true")
 
     now = _now()
     current_exp = _parse_dt(row.get("expires_at"))
@@ -502,7 +683,6 @@ def extend_key(data: ExtendKeyRequest, x_admin_secret: str = Header(...)):
     conn.commit()
     cur.close()
     conn.close()
-
     return {
         "ok": True,
         "key": key,
@@ -561,7 +741,6 @@ def list_keys(x_admin_secret: str = Header(...)):
 def stats(x_admin_secret: str = Header(...)):
     if x_admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
-
     conn = get_db()
     cur = conn.cursor()
     cur.execute("SELECT key, used, revoked, expires_at FROM licenses")
@@ -581,7 +760,6 @@ def stats(x_admin_secret: str = Header(...)):
             revoked += 1
         elif st == "expired":
             expired += 1
-
     return {
         "total": total,
         "available": available,
