@@ -2,6 +2,7 @@
 Galaxy Sniper License Server
 + force-update / kill-switch
 + rate-limit, longer keys, bulk admin, notes
++ update_sha256 for safe auto-update
 """
 
 from fastapi import FastAPI, HTTPException, Header, Request
@@ -26,7 +27,6 @@ if not DATABASE_URL:
 
 ADMIN_SECRET = os.getenv("ADMIN_SECRET")
 if not ADMIN_SECRET or ADMIN_SECRET == "change-me-to-something-long":
-    # Fail closed in production-like setups; allow only if explicitly set
     if os.getenv("ALLOW_INSECURE_ADMIN_SECRET", "").lower() not in ("1", "true", "yes"):
         raise RuntimeError(
             "ADMIN_SECRET must be set to a long random value "
@@ -40,12 +40,11 @@ SERVER_LATEST_VERSION = os.getenv("LATEST_VERSION", "1.0.0")
 _RATE_LOCK = threading.Lock()
 _RATE_BUCKETS: Dict[str, deque] = defaultdict(deque)
 
-# max requests per window
 RATE_LIMITS = {
-    "activate": (12, 60),    # 12 / min per IP
-    "validate": (30, 60),    # 30 / min per IP
+    "activate": (12, 60),
+    "validate": (30, 60),
     "client_check": (20, 60),
-    "activate_key": (8, 300),  # 8 / 5min per key
+    "activate_key": (8, 300),
 }
 
 
@@ -128,6 +127,7 @@ def init_db():
         "latest_version": SERVER_LATEST_VERSION,
         "update_message": "Доступно обязательное обновление. Установите новую версию, чтобы продолжить.",
         "update_url": "",
+        "update_sha256": "",
         "block_all": "0",
         "block_message": "Сервис временно недоступен. Обратитесь в поддержку.",
     }
@@ -229,13 +229,11 @@ def _version_less(a: str, b: str) -> bool:
 
 
 def _gen_key() -> str:
-    """32 hex chars (~128 bit) grouped for readability."""
     raw = secrets.token_hex(16).upper()
     return f"{raw[0:8]}-{raw[8:16]}-{raw[16:24]}-{raw[24:32]}"
 
 
 def _normalize_key(value: str) -> str:
-    """Uppercase, keep only A-Z0-9 (ignore dashes/spaces)."""
     return "".join(c for c in (value or "").upper() if c.isalnum())
 
 
@@ -245,7 +243,6 @@ def _require_admin(secret: str):
 
 
 def _find_license(cur, key_raw: str):
-    """Find license by key; accepts dashed or plain form."""
     key = (key_raw or "").strip().upper()
     if not key:
         return None, ""
@@ -319,7 +316,7 @@ class AddKeyRequest(BaseModel):
     duration_seconds: Optional[int] = Field(default=None, ge=0)
     note: Optional[str] = None
     batch_id: Optional[str] = None
-    prefix: Optional[str] = None  # optional prefix before generated key
+    prefix: Optional[str] = None
 
 
 class ExtendKeyRequest(BaseModel):
@@ -347,6 +344,7 @@ class ForceUpdateRequest(BaseModel):
     latest_version: Optional[str] = None
     update_message: Optional[str] = None
     update_url: Optional[str] = None
+    update_sha256: Optional[str] = None
     block_message: Optional[str] = None
 
 
@@ -358,6 +356,21 @@ class BulkStatusRequest(BaseModel):
 @app.get("/")
 def root():
     return {"status": "ok", "service": "Galaxy Sniper License", "version": SERVER_LATEST_VERSION}
+
+
+@app.get("/health")
+def health():
+    """Simple health check for monitoring."""
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.fetchone()
+        cur.close()
+        conn.close()
+        return {"status": "ok", "db": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"db error: {e}")
 
 
 @app.post("/client/check")
@@ -376,6 +389,7 @@ def client_check(data: ClientCheckRequest, request: Request):
 
     update_message = cfg.get("update_message") or ""
     update_url = cfg.get("update_url") or ""
+    update_sha256 = (cfg.get("update_sha256") or "").strip().lower()
     block_message = cfg.get("block_message") or ""
 
     if block_all:
@@ -387,6 +401,7 @@ def client_check(data: ClientCheckRequest, request: Request):
             "min_version": min_ver,
             "latest_version": latest,
             "update_url": update_url,
+            "update_sha256": update_sha256,
             "client_version": client_ver,
         }
 
@@ -402,6 +417,7 @@ def client_check(data: ClientCheckRequest, request: Request):
             "min_version": min_ver,
             "latest_version": latest,
             "update_url": update_url,
+            "update_sha256": update_sha256,
             "client_version": client_ver,
         }
 
@@ -414,6 +430,7 @@ def client_check(data: ClientCheckRequest, request: Request):
         "min_version": min_ver,
         "latest_version": latest,
         "update_url": update_url,
+        "update_sha256": update_sha256,
         "client_version": client_ver,
     }
 
@@ -571,6 +588,7 @@ def admin_get_app_config(x_admin_secret: str = Header(...)):
         "latest_version": cfg.get("latest_version") or "1.0.0",
         "update_message": cfg.get("update_message") or "",
         "update_url": cfg.get("update_url") or "",
+        "update_sha256": cfg.get("update_sha256") or "",
         "block_message": cfg.get("block_message") or "",
     }
 
@@ -592,6 +610,8 @@ def admin_force_update(data: ForceUpdateRequest, x_admin_secret: str = Header(..
         updates["update_message"] = data.update_message
     if data.update_url is not None:
         updates["update_url"] = data.update_url
+    if data.update_sha256 is not None:
+        updates["update_sha256"] = data.update_sha256.strip().lower()
     if data.block_message is not None:
         updates["block_message"] = data.block_message
 
@@ -693,7 +713,6 @@ def revoke_key(data: RevokeKeyRequest, x_admin_secret: str = Header(...)):
 
 @app.post("/admin/unrevoke")
 def unrevoke_key(data: RevokeKeyRequest, x_admin_secret: str = Header(...)):
-    """Снять отзыв с ключа(ей)."""
     _require_admin(x_admin_secret)
 
     keys_list = list(data.keys or [])
@@ -887,7 +906,6 @@ def extend_key(data: ExtendKeyRequest, x_admin_secret: str = Header(...)):
         "ok": ok_count > 0,
         "results": results,
         "count": ok_count,
-        # backward compat for single-key UI
         "permanent": data.permanent if ok_count == 1 and len(results) == 1 else None,
         "expires_at": results[0].get("expires_at") if len(results) == 1 else None,
         "key": results[0].get("key") if len(results) == 1 else None,
@@ -958,7 +976,6 @@ def list_keys(
     total_filtered = len(keys)
     page = keys[offset: offset + limit]
 
-    # global counters from full table
     all_keys = [_row_to_key(row) for row in rows]
     return {
         "total": len(all_keys),
