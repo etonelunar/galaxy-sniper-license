@@ -3,6 +3,7 @@ Galaxy Sniper License Server
 + force-update / kill-switch
 + rate-limit, longer keys, bulk admin, notes
 + update_sha256 for safe auto-update
++ key_type: free | premium  (server is source of truth)
 """
 
 from fastapi import FastAPI, HTTPException, Header, Request
@@ -36,7 +37,9 @@ if not ADMIN_SECRET or ADMIN_SECRET == "change-me-to-something-long":
 
 SERVER_LATEST_VERSION = os.getenv("LATEST_VERSION", "1.0.0")
 
-# ── Rate limit (in-memory; fine for single Render instance) ──
+# free = max 1 queue in client; premium = full access
+VALID_KEY_TYPES = ("free", "premium")
+
 _RATE_LOCK = threading.Lock()
 _RATE_BUCKETS: Dict[str, deque] = defaultdict(deque)
 
@@ -71,6 +74,13 @@ def get_db():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 
+def _normalize_key_type(value: Optional[str]) -> str:
+    t = (value or "premium").strip().lower()
+    if t not in VALID_KEY_TYPES:
+        return "premium"
+    return t
+
+
 def init_db():
     conn = get_db()
     cur = conn.cursor()
@@ -86,7 +96,8 @@ def init_db():
             duration_seconds INTEGER,
             expires_at TEXT,
             note TEXT DEFAULT '',
-            batch_id TEXT DEFAULT ''
+            batch_id TEXT DEFAULT '',
+            key_type TEXT DEFAULT 'premium'
         )
     """)
     conn.commit()
@@ -97,6 +108,7 @@ def init_db():
         ("expires_at", "TEXT"),
         ("note", "TEXT DEFAULT ''"),
         ("batch_id", "TEXT DEFAULT ''"),
+        ("key_type", "TEXT DEFAULT 'premium'"),
     ]:
         try:
             cur.execute(f"ALTER TABLE licenses ADD COLUMN {col} {typedef}")
@@ -104,11 +116,22 @@ def init_db():
         except Exception:
             conn.rollback()
 
+    # Existing rows without type → premium (do not break paid users)
+    try:
+        cur.execute(
+            "UPDATE licenses SET key_type = 'premium' "
+            "WHERE key_type IS NULL OR key_type = '' OR key_type NOT IN ('free', 'premium')"
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+
     try:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_licenses_hwid ON licenses(hwid)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_licenses_used ON licenses(used)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_licenses_revoked ON licenses(revoked)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_licenses_batch ON licenses(batch_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_licenses_key_type ON licenses(key_type)")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -265,6 +288,7 @@ def _find_license(cur, key_raw: str):
 def _row_to_key(row: dict) -> dict:
     status = _status_of(row)
     dur = row.get("duration_seconds")
+    kt = _normalize_key_type(row.get("key_type"))
     return {
         "key": row["key"],
         "status": status,
@@ -277,6 +301,9 @@ def _row_to_key(row: dict) -> dict:
         "expires_at": row.get("expires_at"),
         "note": row.get("note") or "",
         "batch_id": row.get("batch_id") or "",
+        "key_type": kt,
+        # Free plan limits (client must enforce; type always from server)
+        "max_queues": 1 if kt == "free" else None,
     }
 
 
@@ -317,6 +344,8 @@ class AddKeyRequest(BaseModel):
     note: Optional[str] = None
     batch_id: Optional[str] = None
     prefix: Optional[str] = None
+    # free | premium (default premium)
+    key_type: Optional[str] = Field(default="premium")
 
 
 class ExtendKeyRequest(BaseModel):
@@ -330,6 +359,12 @@ class ExtendKeyRequest(BaseModel):
 class NoteKeyRequest(BaseModel):
     key: str
     note: str = ""
+
+
+class SetKeyTypeRequest(BaseModel):
+    key: Optional[str] = None
+    keys: Optional[List[str]] = None
+    key_type: str = Field(..., description="free or premium")
 
 
 class ClientCheckRequest(BaseModel):
@@ -360,7 +395,6 @@ def root():
 
 @app.get("/health")
 def health():
-    """Simple health check for monitoring."""
     try:
         conn = get_db()
         cur = conn.cursor()
@@ -491,6 +525,8 @@ def activate(data: ActivateRequest, request: Request):
     if duration_seconds is not None and duration_seconds > 0:
         expires_at = (now + timedelta(seconds=int(duration_seconds))).isoformat()
 
+    key_type = _normalize_key_type(row.get("key_type"))
+
     cur.execute(
         """
         UPDATE licenses
@@ -511,7 +547,7 @@ def activate(data: ActivateRequest, request: Request):
 
     token = hmac.new(
         ADMIN_SECRET.encode(),
-        f"{key}|{hwid}|{now.isoformat()}".encode(),
+        f"{key}|{hwid}|{now.isoformat()}|{key_type}".encode(),
         hashlib.sha256,
     ).hexdigest()
 
@@ -521,6 +557,8 @@ def activate(data: ActivateRequest, request: Request):
         "token": token,
         "expires_at": expires_at,
         "permanent": expires_at is None,
+        "key_type": key_type,
+        "max_queues": 1 if key_type == "free" else None,
     }
 
 
@@ -568,11 +606,15 @@ def validate(data: ValidateRequest, request: Request):
     if stored_hwid and stored_hwid != hwid:
         return {"valid": False, "message": "HWID mismatch"}
 
+    key_type = _normalize_key_type(row.get("key_type"))
+
     return {
         "valid": True,
         "message": "OK",
         "expires_at": row.get("expires_at"),
         "permanent": row.get("expires_at") is None,
+        "key_type": key_type,
+        "max_queues": 1 if key_type == "free" else None,
     }
 
 
@@ -779,6 +821,8 @@ def add_keys(data: AddKeyRequest, x_admin_secret: str = Header(...)):
     if prefix and not prefix.endswith("-"):
         prefix = prefix + "-"
 
+    key_type = _normalize_key_type(data.key_type)
+
     conn = get_db()
     cur = conn.cursor()
     created = []
@@ -793,10 +837,10 @@ def add_keys(data: AddKeyRequest, x_admin_secret: str = Header(...)):
             cur.execute(
                 """
                 INSERT INTO licenses
-                    (key, used, created_at, revoked, duration_seconds, expires_at, note, batch_id)
-                VALUES (%s, 0, %s, 0, %s, NULL, %s, %s)
+                    (key, used, created_at, revoked, duration_seconds, expires_at, note, batch_id, key_type)
+                VALUES (%s, 0, %s, 0, %s, NULL, %s, %s, %s)
                 """,
-                (key, _now().isoformat(), duration_seconds, note, batch_id),
+                (key, _now().isoformat(), duration_seconds, note, batch_id, key_type),
             )
             created.append({
                 "key": key,
@@ -804,6 +848,8 @@ def add_keys(data: AddKeyRequest, x_admin_secret: str = Header(...)):
                 "duration_seconds": duration_seconds,
                 "note": note,
                 "batch_id": batch_id,
+                "key_type": key_type,
+                "max_queues": 1 if key_type == "free" else None,
             })
             if data.key:
                 break
@@ -824,7 +870,40 @@ def add_keys(data: AddKeyRequest, x_admin_secret: str = Header(...)):
         "permanent": duration_seconds is None,
         "duration_seconds": duration_seconds,
         "batch_id": batch_id,
+        "key_type": key_type,
     }
+
+
+@app.post("/admin/set-key-type")
+def set_key_type(data: SetKeyTypeRequest, x_admin_secret: str = Header(...)):
+    """Change free/premium for existing keys (admin only)."""
+    _require_admin(x_admin_secret)
+    kt = _normalize_key_type(data.key_type)
+    if (data.key_type or "").strip().lower() not in VALID_KEY_TYPES:
+        raise HTTPException(status_code=400, detail="key_type must be free or premium")
+
+    keys_list = list(data.keys or [])
+    if data.key:
+        keys_list.append(data.key)
+    keys_list = [k.strip().upper() for k in keys_list if k and k.strip()]
+    if not keys_list:
+        raise HTTPException(status_code=400, detail="Укажи key или keys")
+
+    conn = get_db()
+    cur = conn.cursor()
+    done = []
+    for key in keys_list:
+        cur.execute(
+            "UPDATE licenses SET key_type = %s WHERE key = %s RETURNING key",
+            (kt, key),
+        )
+        row = cur.fetchone()
+        if row:
+            done.append(row["key"])
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"ok": True, "updated": done, "count": len(done), "key_type": kt}
 
 
 @app.post("/admin/extend")
@@ -935,6 +1014,7 @@ def list_keys(
     status: Optional[str] = None,
     q: Optional[str] = None,
     batch_id: Optional[str] = None,
+    key_type: Optional[str] = None,
     limit: int = 5000,
     offset: int = 0,
 ):
@@ -947,7 +1027,7 @@ def list_keys(
     cur.execute(
         """
         SELECT key, used, used_at, created_at, hwid, revoked,
-               duration_seconds, expires_at, note, batch_id
+               duration_seconds, expires_at, note, batch_id, key_type
         FROM licenses
         ORDER BY created_at DESC NULLS LAST
         """
@@ -963,6 +1043,9 @@ def list_keys(
     if batch_id:
         bid = batch_id.strip()
         keys = [k for k in keys if (k.get("batch_id") or "") == bid]
+    if key_type and key_type.strip().lower() in VALID_KEY_TYPES:
+        kt = key_type.strip().lower()
+        keys = [k for k in keys if k.get("key_type") == kt]
     if q:
         qq = q.strip().lower()
         keys = [
@@ -971,6 +1054,7 @@ def list_keys(
             or qq in (k.get("hwid") or "").lower()
             or qq in (k.get("note") or "").lower()
             or qq in (k.get("batch_id") or "").lower()
+            or qq in (k.get("key_type") or "").lower()
         ]
 
     total_filtered = len(keys)
@@ -986,6 +1070,8 @@ def list_keys(
         "used": sum(1 for k in all_keys if k["status"] == "used"),
         "revoked": sum(1 for k in all_keys if k["status"] == "revoked"),
         "expired": sum(1 for k in all_keys if k["status"] == "expired"),
+        "free": sum(1 for k in all_keys if k.get("key_type") == "free"),
+        "premium": sum(1 for k in all_keys if k.get("key_type") == "premium"),
         "keys": page,
     }
 
@@ -996,14 +1082,14 @@ def stats(x_admin_secret: str = Header(...)):
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
-        "SELECT key, used, revoked, expires_at, duration_seconds, created_at, used_at FROM licenses"
+        "SELECT key, used, revoked, expires_at, duration_seconds, created_at, used_at, key_type FROM licenses"
     )
     rows = cur.fetchall()
     cur.close()
     conn.close()
 
     total = len(rows)
-    available = used = revoked = expired = permanent = 0
+    available = used = revoked = expired = permanent = free = premium = 0
     for row in rows:
         st = _status_of(row)
         if st == "available":
@@ -1016,6 +1102,10 @@ def stats(x_admin_secret: str = Header(...)):
             expired += 1
         if row.get("duration_seconds") is None and row.get("expires_at") is None:
             permanent += 1
+        if _normalize_key_type(row.get("key_type")) == "free":
+            free += 1
+        else:
+            premium += 1
 
     return {
         "total": total,
@@ -1024,6 +1114,8 @@ def stats(x_admin_secret: str = Header(...)):
         "revoked": revoked,
         "expired": expired,
         "permanent": permanent,
+        "free": free,
+        "premium": premium,
     }
 
 
@@ -1038,7 +1130,7 @@ def lookup_keys(data: BulkStatusRequest, x_admin_secret: str = Header(...)):
     cur.execute(
         """
         SELECT key, used, used_at, created_at, hwid, revoked,
-               duration_seconds, expires_at, note, batch_id
+               duration_seconds, expires_at, note, batch_id, key_type
         FROM licenses WHERE key = ANY(%s)
         """,
         (list(wanted),),
