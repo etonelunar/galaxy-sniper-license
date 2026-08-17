@@ -3,7 +3,7 @@ Galaxy Sniper License Server
 + force-update / kill-switch
 + rate-limit, longer keys, bulk admin, notes
 + update_sha256 for safe auto-update
-+ key_type (free / premium) — source of truth for client limits
++ key_type (free | premium)
 """
 
 from fastapi import FastAPI, HTTPException, Header, Request
@@ -107,8 +107,11 @@ def init_db():
         except Exception:
             conn.rollback()
 
+    # Backfill NULL key_type → premium
     try:
-        cur.execute("UPDATE licenses SET key_type = 'premium' WHERE key_type IS NULL OR key_type = ''")
+        cur.execute(
+            "UPDATE licenses SET key_type = 'premium' WHERE key_type IS NULL OR key_type = ''"
+        )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -118,6 +121,7 @@ def init_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_licenses_used ON licenses(used)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_licenses_revoked ON licenses(revoked)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_licenses_batch ON licenses(batch_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_licenses_key_type ON licenses(key_type)")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -190,6 +194,11 @@ def _status_of(row: dict) -> str:
     return "available"
 
 
+def _normalize_key_type(value: Optional[str]) -> str:
+    v = (value or "premium").strip().lower()
+    return v if v in ("free", "premium") else "premium"
+
+
 def _get_config() -> dict:
     conn = get_db()
     cur = conn.cursor()
@@ -244,11 +253,6 @@ def _gen_key() -> str:
 
 def _normalize_key(value: str) -> str:
     return "".join(c for c in (value or "").upper() if c.isalnum())
-
-
-def _normalize_key_type(value) -> str:
-    kt = (str(value) if value is not None else "premium").strip().lower()
-    return kt if kt in ("free", "premium") else "premium"
 
 
 def _require_admin(secret: str):
@@ -335,12 +339,6 @@ class AddKeyRequest(BaseModel):
     key_type: Optional[str] = "premium"
 
 
-class SetKeyTypeRequest(BaseModel):
-    key: Optional[str] = None
-    keys: Optional[List[str]] = None
-    key_type: str = "premium"
-
-
 class ExtendKeyRequest(BaseModel):
     key: Optional[str] = None
     keys: Optional[List[str]] = None
@@ -352,6 +350,12 @@ class ExtendKeyRequest(BaseModel):
 class NoteKeyRequest(BaseModel):
     key: str
     note: str = ""
+
+
+class SetKeyTypeRequest(BaseModel):
+    key: Optional[str] = None
+    keys: Optional[List[str]] = None
+    key_type: str = "premium"
 
 
 class ClientCheckRequest(BaseModel):
@@ -513,6 +517,8 @@ def activate(data: ActivateRequest, request: Request):
     if duration_seconds is not None and duration_seconds > 0:
         expires_at = (now + timedelta(seconds=int(duration_seconds))).isoformat()
 
+    key_type = _normalize_key_type(row.get("key_type"))
+
     cur.execute(
         """
         UPDATE licenses
@@ -536,8 +542,6 @@ def activate(data: ActivateRequest, request: Request):
         f"{key}|{hwid}|{now.isoformat()}".encode(),
         hashlib.sha256,
     ).hexdigest()
-
-    key_type = _normalize_key_type(row.get("key_type"))
 
     return {
         "valid": True,
@@ -805,7 +809,7 @@ def add_keys(data: AddKeyRequest, x_admin_secret: str = Header(...)):
     if prefix and not prefix.endswith("-"):
         prefix = prefix + "-"
 
-    key_type = _normalize_key_type(getattr(data, "key_type", None) or "premium")
+    key_type = _normalize_key_type(data.key_type)
 
     conn = get_db()
     cur = conn.cursor()
@@ -853,6 +857,7 @@ def add_keys(data: AddKeyRequest, x_admin_secret: str = Header(...)):
         "permanent": duration_seconds is None,
         "duration_seconds": duration_seconds,
         "batch_id": batch_id,
+        "key_type": key_type,
     }
 
 
@@ -958,12 +963,43 @@ def set_note(data: NoteKeyRequest, x_admin_secret: str = Header(...)):
     return {"ok": True, "key": key, "note": note}
 
 
+@app.post("/admin/set-key-type")
+def set_key_type(data: SetKeyTypeRequest, x_admin_secret: str = Header(...)):
+    _require_admin(x_admin_secret)
+
+    keys_list = list(data.keys or [])
+    if data.key:
+        keys_list.append(data.key)
+    keys_list = [k.strip().upper() for k in keys_list if k and k.strip()]
+    if not keys_list:
+        raise HTTPException(status_code=400, detail="Укажи key или keys")
+
+    key_type = _normalize_key_type(data.key_type)
+
+    conn = get_db()
+    cur = conn.cursor()
+    updated = []
+    for key in keys_list:
+        cur.execute(
+            "UPDATE licenses SET key_type = %s WHERE key = %s RETURNING key",
+            (key_type, key),
+        )
+        row = cur.fetchone()
+        if row:
+            updated.append(row["key"])
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"ok": True, "updated": updated, "count": len(updated), "key_type": key_type}
+
+
 @app.get("/admin/list-keys")
 def list_keys(
     x_admin_secret: str = Header(...),
     status: Optional[str] = None,
     q: Optional[str] = None,
     batch_id: Optional[str] = None,
+    key_type: Optional[str] = None,
     limit: int = 5000,
     offset: int = 0,
 ):
@@ -992,6 +1028,9 @@ def list_keys(
     if batch_id:
         bid = batch_id.strip()
         keys = [k for k in keys if (k.get("batch_id") or "") == bid]
+    if key_type and key_type.strip().lower() in ("free", "premium"):
+        kt = key_type.strip().lower()
+        keys = [k for k in keys if (k.get("key_type") or "premium") == kt]
     if q:
         qq = q.strip().lower()
         keys = [
@@ -1000,6 +1039,7 @@ def list_keys(
             or qq in (k.get("hwid") or "").lower()
             or qq in (k.get("note") or "").lower()
             or qq in (k.get("batch_id") or "").lower()
+            or qq in (k.get("key_type") or "").lower()
         ]
 
     total_filtered = len(keys)
@@ -1015,6 +1055,8 @@ def list_keys(
         "used": sum(1 for k in all_keys if k["status"] == "used"),
         "revoked": sum(1 for k in all_keys if k["status"] == "revoked"),
         "expired": sum(1 for k in all_keys if k["status"] == "expired"),
+        "free": sum(1 for k in all_keys if k.get("key_type") == "free"),
+        "premium": sum(1 for k in all_keys if k.get("key_type") == "premium"),
         "keys": page,
     }
 
@@ -1025,14 +1067,18 @@ def stats(x_admin_secret: str = Header(...)):
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
-        "SELECT key, used, revoked, expires_at, duration_seconds, created_at, used_at FROM licenses"
+        """
+        SELECT key, used, revoked, expires_at, duration_seconds,
+               created_at, used_at, key_type
+        FROM licenses
+        """
     )
     rows = cur.fetchall()
     cur.close()
     conn.close()
 
     total = len(rows)
-    available = used = revoked = expired = permanent = 0
+    available = used = revoked = expired = permanent = free = premium = 0
     for row in rows:
         st = _status_of(row)
         if st == "available":
@@ -1045,6 +1091,11 @@ def stats(x_admin_secret: str = Header(...)):
             expired += 1
         if row.get("duration_seconds") is None and row.get("expires_at") is None:
             permanent += 1
+        kt = _normalize_key_type(row.get("key_type"))
+        if kt == "free":
+            free += 1
+        else:
+            premium += 1
 
     return {
         "total": total,
@@ -1053,40 +1104,9 @@ def stats(x_admin_secret: str = Header(...)):
         "revoked": revoked,
         "expired": expired,
         "permanent": permanent,
+        "free": free,
+        "premium": premium,
     }
-
-
-
-
-@app.post("/admin/set-key-type")
-def set_key_type(data: SetKeyTypeRequest, x_admin_secret: str = Header(...)):
-    """Change Free/Premium type for one or many keys. Client reads type only from activate/validate."""
-    _require_admin(x_admin_secret)
-
-    keys_list = list(data.keys or [])
-    if data.key:
-        keys_list.append(data.key)
-    keys_list = [k.strip().upper() for k in keys_list if k and k.strip()]
-    if not keys_list:
-        raise HTTPException(status_code=400, detail="Укажи key или keys")
-
-    key_type = _normalize_key_type(data.key_type)
-
-    conn = get_db()
-    cur = conn.cursor()
-    done = []
-    for key in keys_list:
-        cur.execute(
-            "UPDATE licenses SET key_type = %s WHERE key = %s RETURNING key",
-            (key_type, key),
-        )
-        row = cur.fetchone()
-        if row:
-            done.append(row["key"])
-    conn.commit()
-    cur.close()
-    conn.close()
-    return {"ok": True, "keys": done, "count": len(done), "key_type": key_type}
 
 
 @app.post("/admin/lookup")
