@@ -3,7 +3,8 @@ Galaxy Sniper License Server
 + force-update / kill-switch
 + rate-limit, longer keys, bulk admin, notes
 + update_sha256 for safe auto-update
-+ key_type (free | premium)
++ key_type (free | premium | trial)
++ trial = Free limits,  once-ever per HWID
 """
 
 from fastapi import FastAPI, HTTPException, Header, Request
@@ -196,7 +197,12 @@ def _status_of(row: dict) -> str:
 
 def _normalize_key_type(value: Optional[str]) -> str:
     v = (value or "premium").strip().lower()
-    return v if v in ("free", "premium") else "premium"
+    return v if v in ("free", "premium", "trial") else "premium"
+
+
+def _is_limited_plan(key_type: Optional[str]) -> bool:
+    """Free and Trial share the same client limits (1 queue, no custom)."""
+    return _normalize_key_type(key_type) in ("free", "trial")
 
 
 def _get_config() -> dict:
@@ -505,6 +511,27 @@ def activate(data: ActivateRequest, request: Request):
         cur.close()
         conn.close()
         return {"valid": False, "message": "Key expired"}
+
+    key_type_pre = _normalize_key_type(row.get("key_type"))
+    # Trial keys: only ONE activation ever per HWID (any trial key)
+    if key_type_pre == "trial":
+        cur.execute(
+            """
+            SELECT key FROM licenses
+            WHERE key_type = 'trial' AND used = 1 AND hwid = %s
+            LIMIT 1
+            """,
+            (hwid,),
+        )
+        already = cur.fetchone()
+        if already:
+            cur.close()
+            conn.close()
+            return {
+                "valid": False,
+                "message": "Trial already used on this device",
+                "code": "trial_already_used",
+            }
 
     if row["used"] == 1:
         cur.close()
@@ -1028,7 +1055,7 @@ def list_keys(
     if batch_id:
         bid = batch_id.strip()
         keys = [k for k in keys if (k.get("batch_id") or "") == bid]
-    if key_type and key_type.strip().lower() in ("free", "premium"):
+    if key_type and key_type.strip().lower() in ("free", "premium", "trial"):
         kt = key_type.strip().lower()
         keys = [k for k in keys if (k.get("key_type") or "premium") == kt]
     if q:
@@ -1057,6 +1084,7 @@ def list_keys(
         "expired": sum(1 for k in all_keys if k["status"] == "expired"),
         "free": sum(1 for k in all_keys if k.get("key_type") == "free"),
         "premium": sum(1 for k in all_keys if k.get("key_type") == "premium"),
+        "trial": sum(1 for k in all_keys if k.get("key_type") == "trial"),
         "keys": page,
     }
 
@@ -1078,7 +1106,7 @@ def stats(x_admin_secret: str = Header(...)):
     conn.close()
 
     total = len(rows)
-    available = used = revoked = expired = permanent = free = premium = 0
+    available = used = revoked = expired = permanent = free = premium = trial = 0
     for row in rows:
         st = _status_of(row)
         if st == "available":
@@ -1094,6 +1122,8 @@ def stats(x_admin_secret: str = Header(...)):
         kt = _normalize_key_type(row.get("key_type"))
         if kt == "free":
             free += 1
+        elif kt == "trial":
+            trial += 1
         else:
             premium += 1
 
@@ -1106,6 +1136,7 @@ def stats(x_admin_secret: str = Header(...)):
         "permanent": permanent,
         "free": free,
         "premium": premium,
+        "trial": trial,
     }
 
 
