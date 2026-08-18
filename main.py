@@ -3,8 +3,10 @@ Galaxy Sniper License Server
 + force-update / kill-switch
 + rate-limit, longer keys, bulk admin, notes
 + update_sha256 for safe auto-update
-+ key_type (free | premium)
-+ free = 1 queue limits + only ONE activation ever per HWID
++ key_type (free | premium | free_2d)
++ free = 1 queue, unlimited activations per HWID
++ free_2d = same limits as free, but only ONE activation ever per HWID
++ admin can clear free_2d HWID block
 """
 
 from fastapi import FastAPI, HTTPException, Header, Request
@@ -128,6 +130,20 @@ def init_db():
         conn.rollback()
 
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS free_2d_claims (
+            hwid TEXT PRIMARY KEY,
+            key TEXT,
+            claimed_at TEXT
+        )
+    """)
+    conn.commit()
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_free_2d_claims_key ON free_2d_claims(key)")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS app_config (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -197,15 +213,21 @@ def _status_of(row: dict) -> str:
 
 def _normalize_key_type(value: Optional[str]) -> str:
     v = (value or "premium").strip().lower()
-    # legacy alias
-    if v == "trial":
-        v = "free"
-    return v if v in ("free", "premium") else "premium"
+    # legacy aliases
+    if v in ("trial", "2_days_free", "free2d", "free_2days"):
+        v = "free_2d"
+    return v if v in ("free", "premium", "free_2d") else "premium"
 
 
 def _is_limited_plan(key_type: Optional[str]) -> bool:
-    """Free: 1 queue, no custom."""
-    return _normalize_key_type(key_type) == "free"
+    """Free and free_2d: 1 queue, no custom (client shows both as FREE)."""
+    return _normalize_key_type(key_type) in ("free", "free_2d")
+
+
+def _client_key_type(key_type: Optional[str]) -> str:
+    """What the desktop app should store/display: free_2d → free."""
+    kt = _normalize_key_type(key_type)
+    return "free" if kt in ("free", "free_2d") else "premium"
 
 
 def _get_config() -> dict:
@@ -516,25 +538,17 @@ def activate(data: ActivateRequest, request: Request):
         return {"valid": False, "message": "Key expired"}
 
     key_type_pre = _normalize_key_type(row.get("key_type"))
-    # Free keys: only ONE activation ever per HWID (any free key)
-    if key_type_pre == "free":
-        cur.execute(
-            """
-            SELECT key FROM licenses
-            WHERE lower(coalesce(key_type, 'premium')) IN ('free', 'trial')
-              AND used = 1 AND hwid = %s
-            LIMIT 1
-            """,
-            (hwid,),
-        )
+    # free_2d only: one claim per HWID for the entire free_2d pool
+    if key_type_pre == "free_2d":
+        cur.execute("SELECT key FROM free_2d_claims WHERE hwid = %s LIMIT 1", (hwid,))
         already = cur.fetchone()
         if already:
             cur.close()
             conn.close()
             return {
                 "valid": False,
-                "message": "Free license already used on this device",
-                "code": "free_already_used",
+                "message": "Free 2-day license already used on this device",
+                "code": "free_2d_already_used",
             }
 
     if row["used"] == 1:
@@ -564,6 +578,38 @@ def activate(data: ActivateRequest, request: Request):
         conn.close()
         return {"valid": False, "message": "Key already used"}
 
+    if key_type == "free_2d":
+        try:
+            cur.execute(
+                """
+                INSERT INTO free_2d_claims (hwid, key, claimed_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (hwid) DO NOTHING
+                """,
+                (hwid, key, now.isoformat()),
+            )
+            # If conflict slipped through race, roll back activation
+            cur.execute("SELECT key FROM free_2d_claims WHERE hwid = %s", (hwid,))
+            claim = cur.fetchone()
+            if claim and claim.get("key") != key:
+                conn.rollback()
+                cur.close()
+                conn.close()
+                return {
+                    "valid": False,
+                    "message": "Free 2-day license already used on this device",
+                    "code": "free_2d_already_used",
+                }
+        except Exception:
+            conn.rollback()
+            cur.close()
+            conn.close()
+            return {
+                "valid": False,
+                "message": "Free 2-day license already used on this device",
+                "code": "free_2d_already_used",
+            }
+
     conn.commit()
     cur.close()
     conn.close()
@@ -580,7 +626,8 @@ def activate(data: ActivateRequest, request: Request):
         "token": token,
         "expires_at": expires_at,
         "permanent": expires_at is None,
-        "key_type": key_type,
+        # Client always sees free_2d as free
+        "key_type": _client_key_type(key_type),
     }
 
 
@@ -633,7 +680,7 @@ def validate(data: ValidateRequest, request: Request):
         "message": "OK",
         "expires_at": row.get("expires_at"),
         "permanent": row.get("expires_at") is None,
-        "key_type": _normalize_key_type(row.get("key_type")),
+        "key_type": _client_key_type(row.get("key_type")),
     }
 
 
@@ -1059,7 +1106,7 @@ def list_keys(
     if batch_id:
         bid = batch_id.strip()
         keys = [k for k in keys if (k.get("batch_id") or "") == bid]
-    if key_type and key_type.strip().lower() in ("free", "premium"):
+    if key_type and key_type.strip().lower() in ("free", "premium", "free_2d"):
         kt = key_type.strip().lower()
         keys = [k for k in keys if (k.get("key_type") or "premium") == kt]
     if q:
@@ -1088,6 +1135,7 @@ def list_keys(
         "expired": sum(1 for k in all_keys if k["status"] == "expired"),
         "free": sum(1 for k in all_keys if k.get("key_type") == "free"),
         "premium": sum(1 for k in all_keys if k.get("key_type") == "premium"),
+        "free_2d": sum(1 for k in all_keys if k.get("key_type") == "free_2d"),
         "keys": page,
     }
 
@@ -1109,7 +1157,7 @@ def stats(x_admin_secret: str = Header(...)):
     conn.close()
 
     total = len(rows)
-    available = used = revoked = expired = permanent = free = premium = 0
+    available = used = revoked = expired = permanent = free = premium = free_2d = 0
     for row in rows:
         st = _status_of(row)
         if st == "available":
@@ -1125,6 +1173,8 @@ def stats(x_admin_secret: str = Header(...)):
         kt = _normalize_key_type(row.get("key_type"))
         if kt == "free":
             free += 1
+        elif kt == "free_2d":
+            free_2d += 1
         else:
             premium += 1
 
@@ -1137,8 +1187,72 @@ def stats(x_admin_secret: str = Header(...)):
         "permanent": permanent,
         "free": free,
         "premium": premium,
+        "free_2d": free_2d,
     }
 
+
+
+
+class ClearFree2dRequest(BaseModel):
+    hwid: Optional[str] = None
+    key: Optional[str] = None
+
+
+@app.post("/admin/clear-free-2d")
+def clear_free_2d_block(data: ClearFree2dRequest, x_admin_secret: str = Header(...)):
+    """Remove free_2d once-per-HWID lock so the device can activate free_2d again."""
+    _require_admin(x_admin_secret)
+    hwid = (data.hwid or "").strip()
+    key = (data.key or "").strip().upper()
+    if not hwid and not key:
+        raise HTTPException(status_code=400, detail="Укажи hwid или key")
+
+    conn = get_db()
+    cur = conn.cursor()
+    removed = []
+
+    if hwid:
+        cur.execute(
+            "DELETE FROM free_2d_claims WHERE hwid = %s RETURNING hwid, key, claimed_at",
+            (hwid,),
+        )
+        for row in cur.fetchall() or []:
+            removed.append({"hwid": row["hwid"], "key": row.get("key"), "claimed_at": row.get("claimed_at")})
+    if key:
+        cur.execute(
+            "DELETE FROM free_2d_claims WHERE key = %s RETURNING hwid, key, claimed_at",
+            (key,),
+        )
+        for row in cur.fetchall() or []:
+            item = {"hwid": row["hwid"], "key": row.get("key"), "claimed_at": row.get("claimed_at")}
+            if item not in removed:
+                removed.append(item)
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"ok": True, "cleared": removed, "count": len(removed)}
+
+
+@app.get("/admin/free-2d-claims")
+def list_free_2d_claims(x_admin_secret: str = Header(...), limit: int = 500):
+    _require_admin(x_admin_secret)
+    limit = max(1, min(int(limit), 5000))
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT hwid, key, claimed_at
+        FROM free_2d_claims
+        ORDER BY claimed_at DESC NULLS LAST
+        LIMIT %s
+        """,
+        (limit,),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return {"claims": [dict(r) for r in rows], "count": len(rows)}
 
 @app.post("/admin/lookup")
 def lookup_keys(data: BulkStatusRequest, x_admin_secret: str = Header(...)):
