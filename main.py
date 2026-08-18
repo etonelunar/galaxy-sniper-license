@@ -144,6 +144,27 @@ def init_db():
         conn.rollback()
 
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS license_accounts (
+            id SERIAL PRIMARY KEY,
+            key TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            account_name TEXT DEFAULT '',
+            hwid TEXT DEFAULT '',
+            first_seen TEXT,
+            last_seen TEXT,
+            UNIQUE(key, account_id)
+        )
+    """)
+    conn.commit()
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_lic_acc_key ON license_accounts(key)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_lic_acc_name ON license_accounts(account_name)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_lic_acc_id ON license_accounts(account_id)")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS app_config (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -310,6 +331,52 @@ def _find_license(cur, key_raw: str):
             return row, row["key"]
     return None, key
 
+
+
+def _accounts_for_key(cur, key: str) -> list:
+    try:
+        cur.execute(
+            """
+            SELECT account_id, account_name, hwid, first_seen, last_seen
+            FROM license_accounts
+            WHERE key = %s
+            ORDER BY last_seen DESC NULLS LAST
+            """,
+            (key,),
+        )
+        return [dict(r) for r in (cur.fetchall() or [])]
+    except Exception:
+        return []
+
+
+def _accounts_for_keys(cur, keys: list) -> dict:
+    """key -> list of accounts"""
+    out = {k: [] for k in keys}
+    if not keys:
+        return out
+    try:
+        cur.execute(
+            """
+            SELECT key, account_id, account_name, hwid, first_seen, last_seen
+            FROM license_accounts
+            WHERE key = ANY(%s)
+            ORDER BY last_seen DESC NULLS LAST
+            """,
+            (list(keys),),
+        )
+        for r in cur.fetchall() or []:
+            k = r["key"]
+            if k in out:
+                out[k].append({
+                    "account_id": r.get("account_id"),
+                    "account_name": r.get("account_name") or "",
+                    "hwid": r.get("hwid") or "",
+                    "first_seen": r.get("first_seen"),
+                    "last_seen": r.get("last_seen"),
+                })
+    except Exception:
+        pass
+    return out
 
 def _row_to_key(row: dict) -> dict:
     status = _status_of(row)
@@ -490,6 +557,74 @@ def client_check(data: ClientCheckRequest, request: Request):
         "update_sha256": update_sha256,
         "client_version": client_ver,
     }
+
+
+
+class ReportAccountsRequest(BaseModel):
+    key: str
+    hwid: str
+    accounts: List[Dict[str, Any]] = []
+
+
+@app.post("/client/report-accounts")
+def report_accounts(data: ReportAccountsRequest, request: Request):
+    """Client reports Discord accounts used with this license (bound by key+hwid)."""
+    ip = _client_ip(request)
+    err = _rate_check(f"report_acc:{ip}", 30, 60)
+    if err:
+        raise HTTPException(status_code=429, detail=err)
+
+    key = (data.key or "").strip().upper()
+    hwid = (data.hwid or "").strip()
+    if not key or not hwid:
+        return {"ok": False, "message": "key and hwid required"}
+
+    conn = get_db()
+    cur = conn.cursor()
+    row, key = _find_license(cur, key)
+    if row is None:
+        cur.close()
+        conn.close()
+        return {"ok": False, "message": "Key not found"}
+    if row.get("used") != 1:
+        cur.close()
+        conn.close()
+        return {"ok": False, "message": "Key not activated"}
+    stored = (row.get("hwid") or "").strip()
+    if stored and stored != hwid:
+        cur.close()
+        conn.close()
+        return {"ok": False, "message": "HWID mismatch"}
+
+    now = _now().isoformat()
+    saved = 0
+    for acc in (data.accounts or [])[:20]:
+        if not isinstance(acc, dict):
+            continue
+        aid = str(acc.get("id") or acc.get("account_id") or "").strip()
+        aname = str(acc.get("name") or acc.get("account_name") or "").strip()[:128]
+        if not aid:
+            continue
+        try:
+            cur.execute(
+                """
+                INSERT INTO license_accounts (key, account_id, account_name, hwid, first_seen, last_seen)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (key, account_id) DO UPDATE SET
+                    account_name = EXCLUDED.account_name,
+                    hwid = EXCLUDED.hwid,
+                    last_seen = EXCLUDED.last_seen
+                """,
+                (key, aid, aname, hwid, now, now),
+            )
+            saved += 1
+        except Exception:
+            conn.rollback()
+            continue
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"ok": True, "saved": saved}
 
 
 @app.post("/activate")
@@ -1101,6 +1236,15 @@ def list_keys(
 
     keys = [_row_to_key(row) for row in rows]
 
+    # Attach Discord accounts reported by clients
+    conn2 = get_db()
+    cur2 = conn2.cursor()
+    acc_map = _accounts_for_keys(cur2, [k["key"] for k in keys])
+    cur2.close()
+    conn2.close()
+    for k in keys:
+        k["accounts"] = acc_map.get(k["key"], [])
+
     if status and status != "all":
         keys = [k for k in keys if k["status"] == status]
     if batch_id:
@@ -1111,14 +1255,24 @@ def list_keys(
         keys = [k for k in keys if (k.get("key_type") or "premium") == kt]
     if q:
         qq = q.strip().lower()
-        keys = [
-            k for k in keys
-            if qq in (k.get("key") or "").lower()
-            or qq in (k.get("hwid") or "").lower()
-            or qq in (k.get("note") or "").lower()
-            or qq in (k.get("batch_id") or "").lower()
-            or qq in (k.get("key_type") or "").lower()
-        ]
+        def _match(k):
+            if qq in (k.get("key") or "").lower():
+                return True
+            if qq in (k.get("hwid") or "").lower():
+                return True
+            if qq in (k.get("note") or "").lower():
+                return True
+            if qq in (k.get("batch_id") or "").lower():
+                return True
+            if qq in (k.get("key_type") or "").lower():
+                return True
+            for a in k.get("accounts") or []:
+                if qq in (a.get("account_name") or "").lower():
+                    return True
+                if qq in (a.get("account_id") or "").lower():
+                    return True
+            return False
+        keys = [k for k in keys if _match(k)]
 
     total_filtered = len(keys)
     page = keys[offset: offset + limit]
@@ -1271,6 +1425,10 @@ def lookup_keys(data: BulkStatusRequest, x_admin_secret: str = Header(...)):
         (list(wanted),),
     )
     rows = cur.fetchall()
+    result = [_row_to_key(r) for r in rows]
+    acc_map = _accounts_for_keys(cur, [k["key"] for k in result])
+    for k in result:
+        k["accounts"] = acc_map.get(k["key"], [])
     cur.close()
     conn.close()
-    return {"keys": [_row_to_key(r) for r in rows]}
+    return {"keys": result}
