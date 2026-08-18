@@ -151,12 +151,15 @@ def init_db():
             account_name TEXT DEFAULT '',
             hwid TEXT DEFAULT '',
             first_seen TEXT,
-            last_seen TEXT,
-            UNIQUE(key, account_id)
+            last_seen TEXT
         )
     """)
     conn.commit()
     try:
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_license_accounts_key_acc "
+            "ON license_accounts(key, account_id)"
+        )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_lic_acc_key ON license_accounts(key)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_lic_acc_name ON license_accounts(account_name)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_lic_acc_id ON license_accounts(account_id)")
@@ -570,23 +573,43 @@ class ReportAccountsRequest(BaseModel):
 def report_accounts(data: ReportAccountsRequest, request: Request):
     """Client reports Discord accounts used with this license (bound by key+hwid)."""
     ip = _client_ip(request)
-    err = _rate_check(f"report_acc:{ip}", 30, 60)
+    err = _rate_check(f"report_acc:{ip}", 60, 60)
     if err:
         raise HTTPException(status_code=429, detail=err)
 
-    key = (data.key or "").strip().upper()
+    key_in = (data.key or "").strip().upper()
     hwid = (data.hwid or "").strip()
-    if not key or not hwid:
+    if not key_in or not hwid:
         return {"ok": False, "message": "key and hwid required"}
 
     conn = get_db()
     cur = conn.cursor()
-    row, key = _find_license(cur, key)
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS license_accounts (
+                id SERIAL PRIMARY KEY,
+                key TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                account_name TEXT DEFAULT '',
+                hwid TEXT DEFAULT '',
+                first_seen TEXT,
+                last_seen TEXT
+            )
+        """)
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_license_accounts_key_acc "
+            "ON license_accounts(key, account_id)"
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+
+    row, key = _find_license(cur, key_in)
     if row is None:
         cur.close()
         conn.close()
         return {"ok": False, "message": "Key not found"}
-    if row.get("used") != 1:
+    if int(row.get("used") or 0) != 1:
         cur.close()
         conn.close()
         return {"ok": False, "message": "Key not activated"}
@@ -598,7 +621,8 @@ def report_accounts(data: ReportAccountsRequest, request: Request):
 
     now = _now().isoformat()
     saved = 0
-    for acc in (data.accounts or [])[:20]:
+    errors = []
+    for acc in (data.accounts or [])[:30]:
         if not isinstance(acc, dict):
             continue
         aid = str(acc.get("id") or acc.get("account_id") or "").strip()
@@ -607,24 +631,80 @@ def report_accounts(data: ReportAccountsRequest, request: Request):
             continue
         try:
             cur.execute(
-                """
-                INSERT INTO license_accounts (key, account_id, account_name, hwid, first_seen, last_seen)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (key, account_id) DO UPDATE SET
-                    account_name = EXCLUDED.account_name,
-                    hwid = EXCLUDED.hwid,
-                    last_seen = EXCLUDED.last_seen
-                """,
-                (key, aid, aname, hwid, now, now),
+                "SELECT id, first_seen FROM license_accounts WHERE key = %s AND account_id = %s",
+                (key, aid),
             )
+            existing = cur.fetchone()
+            if existing:
+                cur.execute(
+                    """
+                    UPDATE license_accounts
+                    SET account_name = CASE WHEN %s <> '' THEN %s ELSE account_name END,
+                        hwid = %s,
+                        last_seen = %s
+                    WHERE key = %s AND account_id = %s
+                    """,
+                    (aname, aname, hwid, now, key, aid),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO license_accounts (key, account_id, account_name, hwid, first_seen, last_seen)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (key, aid, aname, hwid, now, now),
+                )
             saved += 1
-        except Exception:
+        except Exception as e:
+            errors.append(str(e)[:160])
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+    try:
+        conn.commit()
+    except Exception as e:
+        errors.append(f"commit:{e}")
+        try:
             conn.rollback()
-            continue
-    conn.commit()
+        except Exception:
+            pass
+
     cur.close()
     conn.close()
-    return {"ok": True, "saved": saved}
+    return {"ok": True, "saved": saved, "key": key, "errors": errors[:5]}
+
+
+@app.get("/admin/key-accounts")
+def admin_key_accounts(key: str, x_admin_secret: str = Header(...)):
+    """Fetch Discord accounts linked to a license key."""
+    _require_admin(x_admin_secret)
+    key_in = (key or "").strip().upper()
+    if not key_in:
+        raise HTTPException(status_code=400, detail="key required")
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS license_accounts (
+                id SERIAL PRIMARY KEY,
+                key TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                account_name TEXT DEFAULT '',
+                hwid TEXT DEFAULT '',
+                first_seen TEXT,
+                last_seen TEXT
+            )
+        """)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    row, key = _find_license(cur, key_in)
+    accounts = _accounts_for_key(cur, key) if row else []
+    cur.close()
+    conn.close()
+    return {"ok": True, "key": key, "accounts": accounts, "found": row is not None}
 
 
 @app.post("/activate")
