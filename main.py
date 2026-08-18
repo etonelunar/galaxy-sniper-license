@@ -571,7 +571,11 @@ class ReportAccountsRequest(BaseModel):
 
 @app.post("/client/report-accounts")
 def report_accounts(data: ReportAccountsRequest, request: Request):
-    """Client reports Discord accounts used with this license (bound by key+hwid)."""
+    """Client reports Discord accounts used with this license.
+
+    Requires an activated key. HWID is preferred but a mismatch no longer
+    blocks the write — admin still needs to see which Discord accounts use the key.
+    """
     ip = _client_ip(request)
     err = _rate_check(f"report_acc:{ip}", 60, 60)
     if err:
@@ -579,8 +583,8 @@ def report_accounts(data: ReportAccountsRequest, request: Request):
 
     key_in = (data.key or "").strip().upper()
     hwid = (data.hwid or "").strip()
-    if not key_in or not hwid:
-        return {"ok": False, "message": "key and hwid required"}
+    if not key_in:
+        return {"ok": False, "message": "key required"}
 
     conn = get_db()
     cur = conn.cursor()
@@ -602,7 +606,10 @@ def report_accounts(data: ReportAccountsRequest, request: Request):
         )
         conn.commit()
     except Exception:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
 
     row, key = _find_license(cur, key_in)
     if row is None:
@@ -613,11 +620,10 @@ def report_accounts(data: ReportAccountsRequest, request: Request):
         cur.close()
         conn.close()
         return {"ok": False, "message": "Key not activated"}
+
+    # Prefer matching HWID, but do not hard-fail on mismatch (admin visibility)
     stored = (row.get("hwid") or "").strip()
-    if stored and stored != hwid:
-        cur.close()
-        conn.close()
-        return {"ok": False, "message": "HWID mismatch"}
+    hwid_mismatch = bool(stored and hwid and stored != hwid)
 
     now = _now().isoformat()
     saved = 0
@@ -630,8 +636,9 @@ def report_accounts(data: ReportAccountsRequest, request: Request):
         if not aid:
             continue
         try:
+            cur.execute("SAVEPOINT sp_acc")
             cur.execute(
-                "SELECT id, first_seen FROM license_accounts WHERE key = %s AND account_id = %s",
+                "SELECT id FROM license_accounts WHERE key = %s AND account_id = %s",
                 (key, aid),
             )
             existing = cur.fetchone()
@@ -640,11 +647,11 @@ def report_accounts(data: ReportAccountsRequest, request: Request):
                     """
                     UPDATE license_accounts
                     SET account_name = CASE WHEN %s <> '' THEN %s ELSE account_name END,
-                        hwid = %s,
+                        hwid = CASE WHEN %s <> '' THEN %s ELSE hwid END,
                         last_seen = %s
                     WHERE key = %s AND account_id = %s
                     """,
-                    (aname, aname, hwid, now, key, aid),
+                    (aname, aname, hwid, hwid, now, key, aid),
                 )
             else:
                 cur.execute(
@@ -654,13 +661,17 @@ def report_accounts(data: ReportAccountsRequest, request: Request):
                     """,
                     (key, aid, aname, hwid, now, now),
                 )
+            cur.execute("RELEASE SAVEPOINT sp_acc")
             saved += 1
         except Exception as e:
-            errors.append(str(e)[:160])
+            errors.append(f"{aid}:{str(e)[:120]}")
             try:
-                conn.rollback()
+                cur.execute("ROLLBACK TO SAVEPOINT sp_acc")
             except Exception:
-                pass
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
 
     try:
         conn.commit()
@@ -673,7 +684,13 @@ def report_accounts(data: ReportAccountsRequest, request: Request):
 
     cur.close()
     conn.close()
-    return {"ok": True, "saved": saved, "key": key, "errors": errors[:5]}
+    return {
+        "ok": True,
+        "saved": saved,
+        "key": key,
+        "hwid_mismatch": hwid_mismatch,
+        "errors": errors[:5],
+    }
 
 
 @app.get("/admin/key-accounts")
