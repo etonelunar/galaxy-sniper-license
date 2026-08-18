@@ -3,10 +3,10 @@ Galaxy Sniper License Server
 + force-update / kill-switch
 + rate-limit, longer keys, bulk admin, notes
 + update_sha256 for safe auto-update
-+ key_type (free | premium | free_2d)
-+ free = 1 queue, unlimited activations per HWID
-+ free_2d = same limits as free, but only ONE activation ever per HWID
-+ admin can clear free_2d HWID block
++ key_type (basic | free | premium)
++ basic = 1 queue, unlimited activations per HWID  (legacy name: free)
++ free  = same limits as basic, but only ONE activation ever per HWID (legacy: free_2d)
++ admin can clear free HWID block (free_2d_claims table kept for compatibility)
 """
 
 from fastapi import FastAPI, HTTPException, Header, Request
@@ -194,6 +194,44 @@ def init_db():
             (k, v),
         )
     conn.commit()
+
+    # One-time rename: free → basic, free_2d → free (order matters).
+    try:
+        cur.execute(
+            "SELECT value FROM app_config WHERE key = %s",
+            ("migrated_key_types_v2",),
+        )
+        row_m = cur.fetchone()
+        already = bool(row_m and str(row_m.get("value") or "") == "1")
+    except Exception:
+        already = False
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+    if not already:
+        try:
+            cur.execute(
+                "UPDATE licenses SET key_type = 'basic' WHERE lower(coalesce(key_type, '')) = 'free'"
+            )
+            cur.execute(
+                "UPDATE licenses SET key_type = 'free' WHERE lower(coalesce(key_type, '')) IN "
+                "('free_2d', 'free2d', '2_days_free', 'free_2days', 'trial')"
+            )
+            cur.execute(
+                """
+                INSERT INTO app_config (key, value) VALUES ('migrated_key_types_v2', '1')
+                ON CONFLICT (key) DO UPDATE SET value = '1'
+                """
+            )
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
     cur.close()
     conn.close()
 
@@ -237,21 +275,30 @@ def _status_of(row: dict) -> str:
 
 def _normalize_key_type(value: Optional[str]) -> str:
     v = (value or "premium").strip().lower()
-    # legacy aliases
-    if v in ("trial", "2_days_free", "free2d", "free_2days"):
-        v = "free_2d"
-    return v if v in ("free", "premium", "free_2d") else "premium"
+    # legacy aliases → current names
+    if v in ("free_2d", "free2d", "2_days_free", "free_2days", "trial"):
+        v = "free"  # once-per-HWID plan (was free_2d)
+    elif v == "free":
+        # bare "free" in *new* API means once-per-HWID Free plan.
+        # Legacy DB rows were migrated free→basic in init_db.
+        # If a client still sends old "free" meaning Basic, accept "basic" explicitly.
+        v = "free"
+    if v in ("basic", "free", "premium"):
+        return v
+    return "premium"
 
 
 def _is_limited_plan(key_type: Optional[str]) -> bool:
-    """Free and free_2d: 1 queue, no custom (client shows both as FREE)."""
-    return _normalize_key_type(key_type) in ("free", "free_2d")
+    """Basic and Free: 1 queue, no custom tabs."""
+    return _normalize_key_type(key_type) in ("basic", "free")
 
 
 def _client_key_type(key_type: Optional[str]) -> str:
-    """What the desktop app should store/display: free_2d → free."""
+    """What the desktop app stores/displays: basic | free | premium."""
     kt = _normalize_key_type(key_type)
-    return "free" if kt in ("free", "free_2d") else "premium"
+    if kt in ("basic", "free"):
+        return kt
+    return "premium"
 
 
 def _get_config() -> dict:
@@ -770,8 +817,8 @@ def activate(data: ActivateRequest, request: Request):
         return {"valid": False, "message": "Key expired"}
 
     key_type_pre = _normalize_key_type(row.get("key_type"))
-    # free_2d only: one claim per HWID for the entire free_2d pool
-    if key_type_pre == "free_2d":
+    # Free (once-per-HWID) only: one claim per HWID for the entire Free pool
+    if key_type_pre == "free":
         cur.execute("SELECT key FROM free_2d_claims WHERE hwid = %s LIMIT 1", (hwid,))
         already = cur.fetchone()
         if already:
@@ -779,8 +826,8 @@ def activate(data: ActivateRequest, request: Request):
             conn.close()
             return {
                 "valid": False,
-                "message": "Free 2-day license already used on this device",
-                "code": "free_2d_already_used",
+                "message": "Free license already used on this device",
+                "code": "free_already_used",
             }
 
     if row["used"] == 1:
@@ -810,7 +857,7 @@ def activate(data: ActivateRequest, request: Request):
         conn.close()
         return {"valid": False, "message": "Key already used"}
 
-    if key_type == "free_2d":
+    if key_type == "free":
         try:
             cur.execute(
                 """
@@ -829,8 +876,8 @@ def activate(data: ActivateRequest, request: Request):
                 conn.close()
                 return {
                     "valid": False,
-                    "message": "Free 2-day license already used on this device",
-                    "code": "free_2d_already_used",
+                    "message": "Free license already used on this device",
+                    "code": "free_already_used",
                 }
         except Exception:
             conn.rollback()
@@ -838,8 +885,8 @@ def activate(data: ActivateRequest, request: Request):
             conn.close()
             return {
                 "valid": False,
-                "message": "Free 2-day license already used on this device",
-                "code": "free_2d_already_used",
+                "message": "Free license already used on this device",
+                "code": "free_already_used",
             }
 
     conn.commit()
@@ -858,7 +905,7 @@ def activate(data: ActivateRequest, request: Request):
         "token": token,
         "expires_at": expires_at,
         "permanent": expires_at is None,
-        # Client always sees free_2d as free
+        # Client receives basic | free | premium
         "key_type": _client_key_type(key_type),
     }
 
@@ -1347,8 +1394,10 @@ def list_keys(
     if batch_id:
         bid = batch_id.strip()
         keys = [k for k in keys if (k.get("batch_id") or "") == bid]
-    if key_type and key_type.strip().lower() in ("free", "premium", "free_2d"):
+    if key_type and key_type.strip().lower() in ("basic", "free", "premium", "free_2d"):
         kt = key_type.strip().lower()
+        if kt == "free_2d":
+            kt = "free"
         keys = [k for k in keys if (k.get("key_type") or "premium") == kt]
     if q:
         qq = q.strip().lower()
@@ -1384,9 +1433,10 @@ def list_keys(
         "used": sum(1 for k in all_keys if k["status"] == "used"),
         "revoked": sum(1 for k in all_keys if k["status"] == "revoked"),
         "expired": sum(1 for k in all_keys if k["status"] == "expired"),
+        "basic": sum(1 for k in all_keys if k.get("key_type") == "basic"),
         "free": sum(1 for k in all_keys if k.get("key_type") == "free"),
         "premium": sum(1 for k in all_keys if k.get("key_type") == "premium"),
-        "free_2d": sum(1 for k in all_keys if k.get("key_type") == "free_2d"),
+        "free_2d": sum(1 for k in all_keys if k.get("key_type") == "free"),  # legacy alias
         "keys": page,
     }
 
@@ -1408,7 +1458,7 @@ def stats(x_admin_secret: str = Header(...)):
     conn.close()
 
     total = len(rows)
-    available = used = revoked = expired = permanent = free = premium = free_2d = 0
+    available = used = revoked = expired = permanent = basic = free = premium = 0
     for row in rows:
         st = _status_of(row)
         if st == "available":
@@ -1422,10 +1472,10 @@ def stats(x_admin_secret: str = Header(...)):
         if row.get("duration_seconds") is None and row.get("expires_at") is None:
             permanent += 1
         kt = _normalize_key_type(row.get("key_type"))
-        if kt == "free":
+        if kt == "basic":
+            basic += 1
+        elif kt == "free":
             free += 1
-        elif kt == "free_2d":
-            free_2d += 1
         else:
             premium += 1
 
@@ -1436,9 +1486,11 @@ def stats(x_admin_secret: str = Header(...)):
         "revoked": revoked,
         "expired": expired,
         "permanent": permanent,
+        "basic": basic,
         "free": free,
         "premium": premium,
-        "free_2d": free_2d,
+        # legacy aliases for older admin clients
+        "free_2d": free,
     }
 
 
@@ -1451,7 +1503,7 @@ class ClearFree2dRequest(BaseModel):
 
 @app.post("/admin/clear-free-2d")
 def clear_free_2d_block(data: ClearFree2dRequest, x_admin_secret: str = Header(...)):
-    """Remove free_2d once-per-HWID lock so the device can activate free_2d again."""
+    """Remove Free once-per-HWID lock so the device can activate a Free key again."""
     _require_admin(x_admin_secret)
     hwid = (data.hwid or "").strip()
     key = (data.key or "").strip().upper()
