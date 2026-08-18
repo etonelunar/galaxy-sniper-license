@@ -168,6 +168,22 @@ def init_db():
         conn.rollback()
 
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS account_purges (
+            id SERIAL PRIMARY KEY,
+            key TEXT NOT NULL,
+            account_id TEXT NOT NULL,
+            purged_at TEXT,
+            UNIQUE (key, account_id)
+        )
+    """)
+    conn.commit()
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_account_purges_key ON account_purges(key)")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS app_config (
             key TEXT PRIMARY KEY,
             value TEXT
@@ -428,6 +444,68 @@ def _accounts_for_keys(cur, keys: list) -> dict:
         pass
     return out
 
+
+def _purges_for_key(cur, key: str) -> list:
+    try:
+        cur.execute(
+            "SELECT account_id FROM account_purges WHERE key = %s",
+            (key,),
+        )
+        return [str(r["account_id"]) for r in (cur.fetchall() or []) if r.get("account_id")]
+    except Exception:
+        return []
+
+
+def _purge_accounts_admin(cur, key: str, account_ids: list | None) -> list:
+    """Remove accounts from license_accounts and queue client-side purge.
+
+    If account_ids is None/empty — purge ALL accounts for the key.
+    Returns list of account_ids that were purged.
+    """
+    key = (key or "").strip().upper()
+    if not key:
+        return []
+    purged = []
+    if account_ids:
+        ids = [str(a).strip() for a in account_ids if str(a).strip()]
+        for aid in ids:
+            cur.execute(
+                "DELETE FROM license_accounts WHERE key = %s AND account_id = %s RETURNING account_id",
+                (key, aid),
+            )
+            row = cur.fetchone()
+            if row:
+                purged.append(str(row["account_id"]))
+            else:
+                purged.append(aid)  # still force client remove
+            cur.execute(
+                """
+                INSERT INTO account_purges (key, account_id, purged_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (key, account_id) DO UPDATE SET purged_at = EXCLUDED.purged_at
+                """,
+                (key, aid, _now().isoformat()),
+            )
+    else:
+        cur.execute(
+            "DELETE FROM license_accounts WHERE key = %s RETURNING account_id",
+            (key,),
+        )
+        rows = cur.fetchall() or []
+        for r in rows:
+            aid = str(r["account_id"])
+            purged.append(aid)
+            cur.execute(
+                """
+                INSERT INTO account_purges (key, account_id, purged_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (key, account_id) DO UPDATE SET purged_at = EXCLUDED.purged_at
+                """,
+                (key, aid, _now().isoformat()),
+            )
+    return purged
+
+
 def _row_to_key(row: dict) -> dict:
     status = _status_of(row)
     dur = row.get("duration_seconds")
@@ -675,12 +753,16 @@ def report_accounts(data: ReportAccountsRequest, request: Request):
     now = _now().isoformat()
     saved = 0
     errors = []
+    purge_ids = set(_purges_for_key(cur, key))
     for acc in (data.accounts or [])[:30]:
         if not isinstance(acc, dict):
             continue
         aid = str(acc.get("id") or acc.get("account_id") or "").strip()
         aname = str(acc.get("name") or acc.get("account_name") or "").strip()[:128]
         if not aid:
+            continue
+        if aid in purge_ids:
+            # Admin requested removal — do not re-register until client acks and user re-adds
             continue
         try:
             cur.execute("SAVEPOINT sp_acc")
@@ -737,6 +819,7 @@ def report_accounts(data: ReportAccountsRequest, request: Request):
         "key": key,
         "hwid_mismatch": hwid_mismatch,
         "errors": errors[:5],
+        "purge_account_ids": list(purge_ids),
     }
 
 
@@ -769,6 +852,69 @@ def admin_key_accounts(key: str, x_admin_secret: str = Header(...)):
     cur.close()
     conn.close()
     return {"ok": True, "key": key, "accounts": accounts, "found": row is not None}
+
+
+
+@app.post("/admin/remove-accounts")
+def admin_remove_accounts(data: dict, x_admin_secret: str = Header(...)):
+    """Remove Discord account(s) linked to a key.
+
+    Body: { "key": "...", "account_ids": ["id1", ...] optional }
+    If account_ids omitted/empty — remove ALL accounts for the key.
+    Clients will drop these accounts on next validate/report.
+    """
+    _require_admin(x_admin_secret)
+    key = (data.get("key") or "").strip().upper()
+    if not key:
+        raise HTTPException(status_code=400, detail="key required")
+    raw_ids = data.get("account_ids") or data.get("account_id")
+    if isinstance(raw_ids, str):
+        account_ids = [raw_ids]
+    elif isinstance(raw_ids, list):
+        account_ids = raw_ids
+    else:
+        account_ids = None
+
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        purged = _purge_accounts_admin(cur, key, account_ids)
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=500, detail=str(e))
+    cur.close()
+    conn.close()
+    return {"ok": True, "key": key, "purged": purged, "count": len(purged)}
+
+
+@app.post("/client/ack-purges")
+def client_ack_purges(data: dict, request: Request):
+    """Client confirms it removed purged accounts locally."""
+    key = (data.get("key") or "").strip().upper()
+    hwid = (data.get("hwid") or "").strip()
+    ids = data.get("account_ids") or []
+    if not key or not ids:
+        return {"ok": False, "message": "key and account_ids required"}
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        for aid in ids:
+            aid = str(aid).strip()
+            if not aid:
+                continue
+            cur.execute(
+                "DELETE FROM account_purges WHERE key = %s AND account_id = %s",
+                (key, aid),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+    cur.close()
+    conn.close()
+    return {"ok": True}
 
 
 @app.post("/activate")
@@ -954,12 +1100,23 @@ def validate(data: ValidateRequest, request: Request):
     if stored_hwid and stored_hwid != hwid:
         return {"valid": False, "message": "HWID mismatch"}
 
+    purge_ids = []
+    try:
+        conn2 = get_db()
+        cur2 = conn2.cursor()
+        purge_ids = _purges_for_key(cur2, key)
+        cur2.close()
+        conn2.close()
+    except Exception:
+        purge_ids = []
+
     return {
         "valid": True,
         "message": "OK",
         "expires_at": row.get("expires_at"),
         "permanent": row.get("expires_at") is None,
         "key_type": _client_key_type(row.get("key_type")),
+        "purge_account_ids": purge_ids,
     }
 
 
