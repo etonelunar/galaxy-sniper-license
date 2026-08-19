@@ -4,8 +4,9 @@ Galaxy Sniper License Server
 + rate-limit, longer keys, bulk admin, notes
 + update_sha256 for safe auto-update
 + key_type (basic | free | premium)
-+ basic = 1 queue, unlimited activations per HWID  (legacy name: free)
-+ free  = same limits as basic, but only ONE activation ever per HWID (legacy: free_2d)
++ basic = 1 queue, no premium UI features; unlimited activations per HWID
++ free  = Premium feature set; only ONE activation ever per HWID (legacy: free_2d)
++ premium = full features; unlimited activations per HWID
 + admin can clear free HWID block (free_2d_claims table kept for compatibility)
 """
 
@@ -305,8 +306,12 @@ def _normalize_key_type(value: Optional[str]) -> str:
 
 
 def _is_limited_plan(key_type: Optional[str]) -> bool:
-    """Basic and Free: 1 queue, no custom tabs."""
-    return _normalize_key_type(key_type) in ("basic", "free")
+    """Basic only: 1 queue / no premium client features.
+
+    Free is treated as full-feature (like Premium) for client limits;
+    once-per-HWID is enforced separately on activation via free_2d_claims.
+    """
+    return _normalize_key_type(key_type) == "basic"
 
 
 def _client_key_type(key_type: Optional[str]) -> str:
