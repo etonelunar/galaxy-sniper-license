@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any
 from collections import defaultdict, deque
 import os
+import json
 import secrets
 import hashlib
 import hmac
@@ -192,15 +193,32 @@ def init_db():
     """)
     conn.commit()
 
+    _default_update_messages = {
+        "en": "A mandatory update is available. Install the new version to continue.",
+        "ru": "Доступно обязательное обновление. Установите новую версию, чтобы продолжить.",
+        "es": "Hay una actualización obligatoria disponible. Instala la nueva versión para continuar.",
+        "pt": "Está disponível uma atualização obrigatória. Instale a nova versão para continuar.",
+        "de": "Ein verpflichtendes Update ist verfügbar. Installiere die neue Version, um fortzufahren.",
+        "fr": "Une mise à jour obligatoire est disponible. Installez la nouvelle version pour continuer.",
+    }
+    _default_block_messages = {
+        "en": "The service is temporarily unavailable. Please contact support.",
+        "ru": "Сервис временно недоступен. Обратитесь в поддержку.",
+        "es": "El servicio no está disponible temporalmente. Contacta con soporte.",
+        "pt": "O serviço está temporariamente indisponível. Contacte o suporte.",
+        "de": "Der Dienst ist vorübergehend nicht verfügbar. Bitte den Support kontaktieren.",
+        "fr": "Le service est temporairement indisponible. Contactez le support.",
+    }
     defaults = {
         "force_update": "0",
         "min_version": "1.0.0",
         "latest_version": SERVER_LATEST_VERSION,
-        "update_message": "Доступно обязательное обновление. Установите новую версию, чтобы продолжить.",
+        "update_message": _default_update_messages["ru"],
+        "update_messages": json.dumps(_default_update_messages, ensure_ascii=False),
         "update_url": "",
-        "update_sha256": "",
         "block_all": "0",
-        "block_message": "Сервис временно недоступен. Обратитесь в поддержку.",
+        "block_message": _default_block_messages["ru"],
+        "block_messages": json.dumps(_default_block_messages, ensure_ascii=False),
     }
     for k, v in defaults.items():
         cur.execute(
@@ -330,6 +348,37 @@ def _get_config() -> dict:
     cur.close()
     conn.close()
     return {r["key"]: r["value"] for r in rows}
+
+
+_LANG_CODES = ("en", "ru", "es", "pt", "de", "fr")
+
+
+def _parse_lang_messages(raw: Optional[str], fallback: str = "") -> Dict[str, str]:
+    """Parse JSON map of lang→text; fill missing from fallback single string."""
+    out = {c: "" for c in _LANG_CODES}
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                for c in _LANG_CODES:
+                    v = data.get(c)
+                    if v is not None:
+                        out[c] = str(v).strip()
+        except Exception:
+            pass
+    fb = (fallback or "").strip()
+    if fb:
+        for c in _LANG_CODES:
+            if not out[c]:
+                out[c] = fb
+    return out
+
+
+def _pick_message(messages: Dict[str, str], fallback: str = "") -> str:
+    for c in _LANG_CODES:
+        if (messages.get(c) or "").strip():
+            return messages[c].strip()
+    return (fallback or "").strip()
 
 
 def _set_config(updates: dict):
@@ -600,9 +649,10 @@ class ForceUpdateRequest(BaseModel):
     min_version: Optional[str] = None
     latest_version: Optional[str] = None
     update_message: Optional[str] = None
+    update_messages: Optional[Dict[str, str]] = None
     update_url: Optional[str] = None
-    update_sha256: Optional[str] = None
     block_message: Optional[str] = None
+    block_messages: Optional[Dict[str, str]] = None
 
 
 class BulkStatusRequest(BaseModel):
@@ -644,10 +694,15 @@ def client_check(data: ClientCheckRequest, request: Request):
     force = cfg.get("force_update") == "1"
     block_all = cfg.get("block_all") == "1"
 
-    update_message = cfg.get("update_message") or ""
     update_url = cfg.get("update_url") or ""
-    update_sha256 = (cfg.get("update_sha256") or "").strip().lower()
-    block_message = cfg.get("block_message") or ""
+    update_messages = _parse_lang_messages(
+        cfg.get("update_messages"), cfg.get("update_message") or ""
+    )
+    block_messages = _parse_lang_messages(
+        cfg.get("block_messages"), cfg.get("block_message") or ""
+    )
+    update_message = _pick_message(update_messages, cfg.get("update_message") or "")
+    block_message = _pick_message(block_messages, cfg.get("block_message") or "")
 
     if block_all:
         return {
@@ -655,10 +710,10 @@ def client_check(data: ClientCheckRequest, request: Request):
             "blocked": True,
             "force_update": False,
             "message": block_message or "Сервис временно недоступен.",
+            "messages": block_messages,
             "min_version": min_ver,
             "latest_version": latest,
             "update_url": update_url,
-            "update_sha256": update_sha256,
             "client_version": client_ver,
         }
 
@@ -671,10 +726,10 @@ def client_check(data: ClientCheckRequest, request: Request):
             "blocked": False,
             "force_update": True,
             "message": update_message or "Требуется обновление.",
+            "messages": update_messages,
             "min_version": min_ver,
             "latest_version": latest,
             "update_url": update_url,
-            "update_sha256": update_sha256,
             "client_version": client_ver,
         }
 
@@ -684,10 +739,10 @@ def client_check(data: ClientCheckRequest, request: Request):
         "force_update": False,
         "outdated": outdated,
         "message": "" if not outdated else (update_message or "Доступна новая версия."),
+        "messages": update_messages if outdated else {},
         "min_version": min_ver,
         "latest_version": latest,
         "update_url": update_url,
-        "update_sha256": update_sha256,
         "client_version": client_ver,
     }
 
@@ -1130,15 +1185,22 @@ def validate(data: ValidateRequest, request: Request):
 def admin_get_app_config(x_admin_secret: str = Header(...)):
     _require_admin(x_admin_secret)
     cfg = _get_config()
+    update_messages = _parse_lang_messages(
+        cfg.get("update_messages"), cfg.get("update_message") or ""
+    )
+    block_messages = _parse_lang_messages(
+        cfg.get("block_messages"), cfg.get("block_message") or ""
+    )
     return {
         "force_update": cfg.get("force_update") == "1",
         "block_all": cfg.get("block_all") == "1",
         "min_version": cfg.get("min_version") or "1.0.0",
         "latest_version": cfg.get("latest_version") or "1.0.0",
-        "update_message": cfg.get("update_message") or "",
+        "update_message": _pick_message(update_messages, cfg.get("update_message") or ""),
+        "update_messages": update_messages,
         "update_url": cfg.get("update_url") or "",
-        "update_sha256": cfg.get("update_sha256") or "",
-        "block_message": cfg.get("block_message") or "",
+        "block_message": _pick_message(block_messages, cfg.get("block_message") or ""),
+        "block_messages": block_messages,
     }
 
 
@@ -1155,14 +1217,27 @@ def admin_force_update(data: ForceUpdateRequest, x_admin_secret: str = Header(..
         updates["min_version"] = data.min_version.strip()
     if data.latest_version is not None:
         updates["latest_version"] = data.latest_version.strip()
-    if data.update_message is not None:
-        updates["update_message"] = data.update_message
     if data.update_url is not None:
         updates["update_url"] = data.update_url
-    if data.update_sha256 is not None:
-        updates["update_sha256"] = data.update_sha256.strip().lower()
-    if data.block_message is not None:
+
+    if data.update_messages is not None and isinstance(data.update_messages, dict):
+        cleaned = {c: str(data.update_messages.get(c) or "").strip() for c in _LANG_CODES}
+        updates["update_messages"] = json.dumps(cleaned, ensure_ascii=False)
+        updates["update_message"] = _pick_message(cleaned, "")
+    elif data.update_message is not None:
+        # Legacy single string → fill all langs that were empty / set as default text
+        updates["update_message"] = data.update_message
+        msgs = _parse_lang_messages(None, data.update_message)
+        updates["update_messages"] = json.dumps(msgs, ensure_ascii=False)
+
+    if data.block_messages is not None and isinstance(data.block_messages, dict):
+        cleaned = {c: str(data.block_messages.get(c) or "").strip() for c in _LANG_CODES}
+        updates["block_messages"] = json.dumps(cleaned, ensure_ascii=False)
+        updates["block_message"] = _pick_message(cleaned, "")
+    elif data.block_message is not None:
         updates["block_message"] = data.block_message
+        msgs = _parse_lang_messages(None, data.block_message)
+        updates["block_messages"] = json.dumps(msgs, ensure_ascii=False)
 
     if not updates:
         raise HTTPException(status_code=400, detail="Нечего обновлять")
